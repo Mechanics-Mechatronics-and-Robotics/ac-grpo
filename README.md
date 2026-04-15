@@ -196,6 +196,7 @@ Following the AC-loss design philosophy, prediction and certainty
 are computed by **fully independent parameter sets**:
 
 s_t  →  Policy Backbone    (θ)  →  π_θ(a|s_t)   [prediction]
+
 s_t  →  Certainty Backbone (ψ)  →  c_t           [certainty]
 
 Isolation prevents degenerate solutions in which the policy suppresses
