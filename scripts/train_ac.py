@@ -16,13 +16,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=MODES, default="CLEAN")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--total-steps", type=int, default=TrainConfig().total_steps)
+    parser.add_argument("--ac-loss-temperature", type=float, default=TrainConfig().ac_loss_temperature)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--run-name", default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    config = TrainConfig(total_steps=args.total_steps)
-    summary = ACPPOTrainer(method=args.method, mode=args.mode, seed=args.seed, config=config).train()
+    config = TrainConfig(total_steps=args.total_steps, ac_loss_temperature=args.ac_loss_temperature)
+    summary = ACPPOTrainer(
+        method=args.method,
+        mode=args.mode,
+        seed=args.seed,
+        config=config,
+        output_dir=args.output_dir,
+        run_name=args.run_name,
+    ).train()
     print(summary)
 
 

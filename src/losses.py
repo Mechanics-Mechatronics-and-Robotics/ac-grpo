@@ -3,9 +3,18 @@ from __future__ import annotations
 import torch
 
 
-def alignment_loss(delta_t: torch.Tensor, certainty: torch.Tensor, k: int = 4) -> torch.Tensor:
+def alignment_loss(
+    delta_t: torch.Tensor,
+    certainty: torch.Tensor,
+    k: int = 4,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    if temperature <= 0.0:
+        raise ValueError("temperature must be positive")
     delta = delta_t.detach()
     c = certainty.clamp(1e-6, 1.0 - 1e-6)
+    if temperature != 1.0:
+        c = torch.sigmoid(torch.logit(c) / temperature).clamp(1e-6, 1.0 - 1e-6)
     return -delta * torch.log(c) - (1.0 - delta) * torch.log((1.0 - c) / k)
 
 

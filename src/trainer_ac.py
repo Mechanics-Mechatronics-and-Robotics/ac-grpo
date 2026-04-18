@@ -19,7 +19,16 @@ from src.trainer_baseline import set_seed
 
 
 class ACPPOTrainer:
-    def __init__(self, method: str, mode: str, seed: int, config: TrainConfig | None = None, device: str | None = None) -> None:
+    def __init__(
+        self,
+        method: str,
+        mode: str,
+        seed: int,
+        config: TrainConfig | None = None,
+        device: str | None = None,
+        output_dir: Path | None = None,
+        run_name: str | None = None,
+    ) -> None:
         if method not in {"AC_LITE", "AC_FULL"}:
             raise ValueError("AC trainer supports only AC_LITE or AC_FULL")
         self.method = method
@@ -34,10 +43,18 @@ class ACPPOTrainer:
         self.certainty = CertaintyNet(self.config.obs_size, self.config.hidden_size).to(self.device)
         self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.config.learning_rate)
         self.certainty_optimizer = torch.optim.Adam(self.certainty.parameters(), lr=self.config.learning_rate)
-        self.run_id = f"{method}_{mode}_seed{seed}"
-        self.episode_log = LOG_DIR / f"{self.run_id}_episodes.csv"
-        self.step_log = LOG_DIR / f"{self.run_id}_steps.csv"
-        self.summary_log = LOG_DIR / f"{self.run_id}_summary.json"
+        self.run_id = f"{run_name or method}_{mode}_seed{seed}"
+        if output_dir is None:
+            self.log_dir = LOG_DIR
+            self.checkpoint_dir = CHECKPOINT_DIR
+        else:
+            self.log_dir = output_dir / f"seed_{seed}" / "logs"
+            self.checkpoint_dir = output_dir / f"seed_{seed}" / "checkpoints"
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.episode_log = self.log_dir / f"{self.run_id}_episodes.csv"
+        self.step_log = self.log_dir / f"{self.run_id}_steps.csv"
+        self.summary_log = self.log_dir / f"{self.run_id}_summary.json"
 
     def train(self) -> dict[str, float]:
         self._init_logs()
@@ -56,10 +73,11 @@ class ACPPOTrainer:
             self._update(rollout)
             if float(rollout["certainty"].std(unbiased=False)) < 1e-8:
                 print(f"warning: certainty collapse suspected at step {global_step}")
-        torch.save(self.policy.state_dict(), CHECKPOINT_DIR / f"{self.run_id}_policy.pt")
-        torch.save(self.certainty.state_dict(), CHECKPOINT_DIR / f"{self.run_id}_certainty.pt")
+        torch.save(self.policy.state_dict(), self.checkpoint_dir / f"{self.run_id}_policy.pt")
+        torch.save(self.certainty.state_dict(), self.checkpoint_dir / f"{self.run_id}_certainty.pt")
         summary = {"method": self.method, "mode": self.mode, "seed": self.seed, "total_steps": global_step}
-        self.summary_log.write_text(json.dumps(summary | {"config": asdict(self.config)}, indent=2), encoding="utf-8")
+        summary_with_config = {**summary, "config": asdict(self.config)}
+        self.summary_log.write_text(json.dumps(summary_with_config, indent=2), encoding="utf-8")
         self.env.close()
         return summary
 
@@ -165,7 +183,14 @@ class ACPPOTrainer:
                 ).mean()
                 value_loss = nn.functional.mse_loss(self.policy.value(obs_mb), rollout["returns"][mb])
                 policy_loss = pg_loss + self.config.value_coef * value_loss - self.config.entropy_coef * dist.entropy().mean()
-                cert_terms = [alignment_loss(rollout["delta_old"][mb], certainty_mb, self.config.action_size)]
+                cert_terms = [
+                    alignment_loss(
+                        rollout["delta_old"][mb],
+                        certainty_mb,
+                        self.config.action_size,
+                        self.config.ac_loss_temperature,
+                    )
+                ]
                 if self.method == "AC_FULL":
                     outcome = outcome_loss(rollout["success"][mb], certainty_mb, self.config.alpha)
                     mask = rollout["outcome_mask"][mb]

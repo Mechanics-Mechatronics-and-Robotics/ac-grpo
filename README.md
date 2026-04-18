@@ -9,6 +9,28 @@ open space. A policy that fails on the final step receives the same
 zero reward as one that fails on the first. Certainty is invisible
 to the optimizer.
 
+## Baseline Repair Runs
+
+The current LunarLander phase is baseline-only. Each command below creates
+exactly one timestamped folder under `outputs/`, with all seed artifacts inside
+`seed_42/`, `seed_0/`, `seed_17/`, `seed_9/`, and `seed_3/`.
+
+Smoke test one seed:
+
+```powershell
+py scripts/run_all_seeds.py --experiment baseline_clean_reference --smoke --total-steps 4096
+```
+
+Full baseline repair matrix:
+
+```powershell
+py scripts/run_all_seeds.py --experiment baseline_clean_reference
+py scripts/run_all_seeds.py --experiment baseline_clean_dynsample
+py scripts/run_all_seeds.py --experiment baseline_clean_dynsample_temp14
+py scripts/run_all_seeds.py --experiment baseline_clean_dynsample_temp14_cliphigher
+py scripts/run_all_seeds.py --experiment best_clean_setting_longer
+```
+
 AC-GRPO replaces uniform token credit with a **learned, per-timestep
 certainty gate** $c_t \in (0,1)$ that modulates gradient contribution
 based on the policy's self-assessed reliability at each state. This

@@ -23,14 +23,16 @@ class PolicyNet(nn.Module):
             nn.Linear(hidden_size, 1),
         )
 
-    def distribution(self, obs: torch.Tensor) -> Categorical:
-        return Categorical(logits=self.actor(obs))
+    def distribution(self, obs: torch.Tensor, temperature: float = 1.0) -> Categorical:
+        if temperature <= 0.0:
+            raise ValueError("temperature must be positive")
+        return Categorical(logits=self.actor(obs) / temperature)
 
     def value(self, obs: torch.Tensor) -> torch.Tensor:
         return self.critic(obs).squeeze(-1)
 
-    def act(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        dist = self.distribution(obs)
+    def act(self, obs: torch.Tensor, temperature: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        dist = self.distribution(obs, temperature=temperature)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()

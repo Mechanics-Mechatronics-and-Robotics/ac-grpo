@@ -24,7 +24,15 @@ def set_seed(seed: int) -> None:
 
 
 class PPOBaselineTrainer:
-    def __init__(self, mode: str, seed: int, config: TrainConfig | None = None, device: str | None = None) -> None:
+    def __init__(
+        self,
+        mode: str,
+        seed: int,
+        config: TrainConfig | None = None,
+        device: str | None = None,
+        output_dir: Path | None = None,
+        run_name: str = "BASELINE",
+    ) -> None:
         self.mode = mode
         self.seed = seed
         self.config = config or TrainConfig()
@@ -40,10 +48,19 @@ class PPOBaselineTrainer:
         )
         self.policy = PolicyNet(self.config.obs_size, self.config.action_size, self.config.hidden_size).to(self.device)
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.config.learning_rate)
-        self.run_id = f"BASELINE_{mode}_seed{seed}"
-        self.episode_log = LOG_DIR / f"{self.run_id}_episodes.csv"
-        self.step_log = LOG_DIR / f"{self.run_id}_steps.csv"
-        self.summary_log = LOG_DIR / f"{self.run_id}_summary.json"
+        self.run_id = f"{run_name}_{mode}_seed{seed}"
+        if output_dir is None:
+            self.log_dir = LOG_DIR
+            self.checkpoint_dir = CHECKPOINT_DIR
+        else:
+            self.log_dir = output_dir / f"seed_{seed}" / "logs"
+            self.checkpoint_dir = output_dir / f"seed_{seed}" / "checkpoints"
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.episode_log = self.log_dir / f"{self.run_id}_episodes.csv"
+        self.step_log = self.log_dir / f"{self.run_id}_steps.csv"
+        self.update_log = self.log_dir / f"{self.run_id}_updates.csv"
+        self.summary_log = self.log_dir / f"{self.run_id}_summary.json"
 
     def train(self) -> dict[str, float]:
         self._init_logs()
@@ -53,33 +70,48 @@ class PPOBaselineTrainer:
         episode_length = 0
         episode_id = 0
         while global_step < self.config.total_steps:
-            rollout = self._collect_rollout(obs, global_step, episode_id, episode_return, episode_length)
+            step_budget = self.config.total_steps - global_step
+            dynamic_sampling_active = self.config.dynamic_sampling and global_step >= self.config.dynamic_sampling_warmup_steps
+            if self.config.grouped_rollouts or self.config.dynamic_sampling:
+                rollout = self._collect_grouped_rollout(
+                    obs,
+                    global_step,
+                    episode_id,
+                    episode_return,
+                    episode_length,
+                    step_budget,
+                    dynamic_sampling_active,
+                )
+            else:
+                rollout = self._collect_rollout(obs, global_step, episode_id, episode_return, episode_length, step_budget)
             obs = rollout.pop("next_obs")
             global_step = int(rollout.pop("global_step"))
             episode_return = float(rollout.pop("episode_return"))
             episode_length = int(rollout.pop("episode_length"))
             episode_id = int(rollout.pop("episode_id"))
-            self._update(rollout)
-            if not math.isfinite(float(rollout["rewards"].mean())):
+            update_stats = self._update(rollout) if int(rollout["obs"].shape[0]) > 0 else {"loss": math.nan, "grad_norm": math.nan}
+            self._log_update(global_step, rollout, update_stats)
+            if rollout["rewards"].numel() and not math.isfinite(float(rollout["rewards"].mean())):
                 raise FloatingPointError("NaN detected in rollout rewards")
-        torch.save(self.policy.state_dict(), CHECKPOINT_DIR / f"{self.run_id}.pt")
+        torch.save(self.policy.state_dict(), self.checkpoint_dir / f"{self.run_id}.pt")
         summary = {"method": "BASELINE", "mode": self.mode, "seed": self.seed, "total_steps": global_step}
-        self.summary_log.write_text(json.dumps(summary | {"config": asdict(self.config)}, indent=2), encoding="utf-8")
+        summary_with_config = {**summary, "config": asdict(self.config)}
+        self.summary_log.write_text(json.dumps(summary_with_config, indent=2), encoding="utf-8")
         self.env.close()
         return summary
 
     def _collect_rollout(
-        self, obs: np.ndarray, global_step: int, episode_id: int, episode_return: float, episode_length: int
+        self, obs: np.ndarray, global_step: int, episode_id: int, episode_return: float, episode_length: int, step_budget: int
     ) -> dict[str, torch.Tensor | np.ndarray | int | float]:
         cfg = self.config
         obs_buf, actions, log_probs, rewards, dones, values = [], [], [], [], [], []
         entropies, deltas, episode_ids, timesteps = [], [], [], []
         step_rows = []
         episode_rows = []
-        for _ in range(cfg.steps_per_update):
+        for _ in range(min(cfg.steps_per_update, step_budget)):
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             with torch.no_grad():
-                action, log_prob, entropy, delta, value = self.policy.act(obs_t)
+                action, log_prob, entropy, delta, value = self.policy.act(obs_t, temperature=cfg.rollout_temperature)
             next_obs, reward, terminated, truncated, info = self.env.step(int(action.item()))
             done = terminated or truncated
             obs_buf.append(obs)
@@ -108,6 +140,26 @@ class PPOBaselineTrainer:
         self._append_rows(self.episode_log, episode_rows)
         with torch.no_grad():
             next_value = self.policy.value(torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)).item()
+        if not rewards:
+            empty = torch.tensor([], dtype=torch.float32, device=self.device)
+            return {
+                "obs": torch.empty((0, cfg.obs_size), dtype=torch.float32, device=self.device),
+                "actions": torch.empty((0,), dtype=torch.long, device=self.device),
+                "old_log_probs": empty,
+                "returns": empty,
+                "advantages": empty,
+                "rewards": empty,
+                "entropy": empty,
+                "group_total": torch.tensor(0.0, dtype=torch.float32, device=self.device),
+                "group_discarded": torch.tensor(0.0, dtype=torch.float32, device=self.device),
+                "group_mixed": torch.tensor(0.0, dtype=torch.float32, device=self.device),
+                "group_successes": torch.tensor([], dtype=torch.float32, device=self.device),
+                "next_obs": obs,
+                "global_step": global_step,
+                "episode_return": episode_return,
+                "episode_length": episode_length,
+                "episode_id": episode_id,
+            }
         rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         dones_t = torch.tensor(dones, dtype=torch.float32, device=self.device)
         values_t = torch.tensor(values, dtype=torch.float32, device=self.device)
@@ -119,6 +171,145 @@ class PPOBaselineTrainer:
             "returns": advantages + values_t,
             "advantages": advantages,
             "rewards": rewards_t,
+            "entropy": torch.tensor(entropies, dtype=torch.float32, device=self.device),
+            "group_total": torch.tensor(0.0, dtype=torch.float32, device=self.device),
+            "group_discarded": torch.tensor(0.0, dtype=torch.float32, device=self.device),
+            "group_mixed": torch.tensor(0.0, dtype=torch.float32, device=self.device),
+            "group_successes": torch.tensor([], dtype=torch.float32, device=self.device),
+            "next_obs": obs,
+            "global_step": global_step,
+            "episode_return": episode_return,
+            "episode_length": episode_length,
+            "episode_id": episode_id,
+        }
+
+    def _collect_grouped_rollout(
+        self,
+        obs: np.ndarray,
+        global_step: int,
+        episode_id: int,
+        episode_return: float,
+        episode_length: int,
+        step_budget: int,
+        dynamic_sampling_active: bool,
+    ) -> dict[str, torch.Tensor | np.ndarray | int | float]:
+        cfg = self.config
+        kept_steps: list[dict[str, float | int | np.ndarray]] = []
+        fallback_steps: list[dict[str, float | int | np.ndarray]] = []
+        all_step_rows, episode_rows = [], []
+        group_total = 0
+        group_discarded = 0
+        group_mixed = 0
+        group_success_counts: list[float] = []
+        attempts = 0
+        target_steps = min(cfg.steps_per_update, step_budget)
+        while global_step < self.config.total_steps and len(all_step_rows) < target_steps and attempts < cfg.max_group_attempts_per_update:
+            attempts += 1
+            group_steps: list[dict[str, float | int | np.ndarray]] = []
+            group_successes: list[int] = []
+            for _ in range(cfg.group_size):
+                episode_start = len(group_steps)
+                done = False
+                # Once a group starts, finish full episodes so dynamic sampling has
+                # valid success/fail labels. This may overshoot the per-update
+                # step target, but avoids empty updates from partial groups.
+                while not done:
+                    obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+                    with torch.no_grad():
+                        action, log_prob, entropy, delta, value = self.policy.act(obs_t, temperature=cfg.rollout_temperature)
+                    next_obs, reward, terminated, truncated, info = self.env.step(int(action.item()))
+                    done = terminated or truncated
+                    group_steps.append(
+                        {
+                            "obs": obs,
+                            "action": int(action.item()),
+                            "log_prob": float(log_prob.item()),
+                            "reward": float(reward),
+                            "done": float(done),
+                            "value": float(value.item()),
+                            "entropy": float(entropy.item()),
+                            "delta": float(delta.item()),
+                            "step": global_step,
+                            "episode_id": episode_id,
+                            "timestep": episode_length,
+                        }
+                    )
+                    all_step_rows.append([global_step, episode_id, episode_length, entropy.item(), delta.item(), ""])
+                    episode_return += float(reward)
+                    episode_length += 1
+                    global_step += 1
+                    obs = next_obs
+                outcome = self.env.episode_outcome(episode_return, info)
+                for idx in range(episode_start, len(group_steps)):
+                    group_steps[idx]["episode_success"] = float(outcome.logged_success)
+                group_successes.append(outcome.logged_success)
+                episode_rows.append([global_step, episode_id, episode_return, outcome.logged_success, outcome.raw_success, episode_length])
+                obs, _ = self.env.reset()
+                episode_return = 0.0
+                episode_length = 0
+                episode_id += 1
+            group_total += 1
+            success_count = sum(group_successes)
+            group_success_counts.append(float(success_count))
+            mixed = 0 < success_count < cfg.group_size
+            if mixed:
+                group_mixed += 1
+                kept_steps.extend(group_steps)
+            elif dynamic_sampling_active:
+                group_discarded += 1
+                fallback_steps.extend(group_steps)
+            else:
+                kept_steps.extend(group_steps)
+        used_fallback = False
+        if dynamic_sampling_active and group_total > 0 and group_mixed == 0:
+            if cfg.dynamic_sampling_fallback_on_empty and fallback_steps:
+                kept_steps = fallback_steps
+                used_fallback = True
+                print(f"warning: no mixed groups at step {global_step}; falling back to sampled groups for this update")
+            else:
+                print(f"warning: all {group_total} groups discarded at step {global_step}; skipping this update")
+        self._append_rows(self.step_log, all_step_rows)
+        self._append_rows(self.episode_log, episode_rows)
+        with torch.no_grad():
+            next_value = self.policy.value(torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)).item()
+        if not kept_steps:
+            empty = torch.tensor([], dtype=torch.float32, device=self.device)
+            return {
+                "obs": torch.empty((0, cfg.obs_size), dtype=torch.float32, device=self.device),
+                "actions": torch.empty((0,), dtype=torch.long, device=self.device),
+                "old_log_probs": empty,
+                "returns": empty,
+                "advantages": empty,
+                "rewards": empty,
+                "entropy": empty,
+                "group_total": torch.tensor(float(group_total), dtype=torch.float32, device=self.device),
+                "group_discarded": torch.tensor(float(group_discarded), dtype=torch.float32, device=self.device),
+                "group_mixed": torch.tensor(float(group_mixed), dtype=torch.float32, device=self.device),
+                "used_dynamic_fallback": torch.tensor(float(used_fallback), dtype=torch.float32, device=self.device),
+                "group_successes": torch.tensor(group_success_counts, dtype=torch.float32, device=self.device),
+                "next_obs": obs,
+                "global_step": global_step,
+                "episode_return": episode_return,
+                "episode_length": episode_length,
+                "episode_id": episode_id,
+            }
+        rewards_t = torch.tensor([float(s["reward"]) for s in kept_steps], dtype=torch.float32, device=self.device)
+        dones_t = torch.tensor([float(s["done"]) for s in kept_steps], dtype=torch.float32, device=self.device)
+        values_t = torch.tensor([float(s["value"]) for s in kept_steps], dtype=torch.float32, device=self.device)
+        advantages = self._gae(rewards_t, dones_t, values_t, next_value)
+        return {
+            "obs": torch.tensor(np.asarray([s["obs"] for s in kept_steps]), dtype=torch.float32, device=self.device),
+            "actions": torch.tensor([int(s["action"]) for s in kept_steps], dtype=torch.long, device=self.device),
+            "old_log_probs": torch.tensor([float(s["log_prob"]) for s in kept_steps], dtype=torch.float32, device=self.device),
+            "returns": advantages + values_t,
+            "advantages": advantages,
+            "rewards": rewards_t,
+            "entropy": torch.tensor([float(s["entropy"]) for s in kept_steps], dtype=torch.float32, device=self.device),
+            "group_total": torch.tensor(float(group_total), dtype=torch.float32, device=self.device),
+            "group_discarded": torch.tensor(float(group_discarded), dtype=torch.float32, device=self.device),
+            "group_mixed": torch.tensor(float(group_mixed), dtype=torch.float32, device=self.device),
+            "used_dynamic_fallback": torch.tensor(float(used_fallback), dtype=torch.float32, device=self.device),
+            "group_successes": torch.tensor(group_success_counts, dtype=torch.float32, device=self.device),
             "next_obs": obs,
             "global_step": global_step,
             "episode_return": episode_return,
@@ -137,11 +328,13 @@ class PPOBaselineTrainer:
             advantages[t] = lastgaelam
         return advantages
 
-    def _update(self, rollout: dict[str, torch.Tensor]) -> None:
+    def _update(self, rollout: dict[str, torch.Tensor]) -> dict[str, float]:
         advantages = rollout["advantages"]
         advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
         n = len(advantages)
         idxs = torch.arange(n, device=self.device)
+        last_loss = math.nan
+        last_grad_norm = math.nan
         for _ in range(self.config.update_epochs):
             perm = idxs[torch.randperm(n, device=self.device)]
             for start in range(0, n, self.config.batch_size):
@@ -149,9 +342,10 @@ class PPOBaselineTrainer:
                 dist = self.policy.distribution(rollout["obs"][mb])
                 new_log_prob = dist.log_prob(rollout["actions"][mb])
                 ratio = (new_log_prob - rollout["old_log_probs"][mb]).exp()
+                clipped_ratio = torch.clamp(ratio, 1.0 - self.config.epsilon_low, 1.0 + self.config.epsilon_high)
                 pg_loss = -torch.min(
                     advantages[mb] * ratio,
-                    advantages[mb] * torch.clamp(ratio, 1.0 - self.config.clip_coef, 1.0 + self.config.clip_coef),
+                    advantages[mb] * clipped_ratio,
                 ).mean()
                 value_loss = nn.functional.mse_loss(self.policy.value(rollout["obs"][mb]), rollout["returns"][mb])
                 entropy_loss = dist.entropy().mean()
@@ -160,14 +354,54 @@ class PPOBaselineTrainer:
                     raise FloatingPointError("NaN loss detected")
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+                grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
+                last_loss = float(loss.item())
+                last_grad_norm = float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm)
+        return {"loss": last_loss, "grad_norm": last_grad_norm}
 
     def _init_logs(self) -> None:
         with self.episode_log.open("w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(["step", "episode_id", "return", "success", "raw_success", "episode_length"])
         with self.step_log.open("w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(["step", "episode_id", "timestep", "entropy", "delta", "certainty"])
+        with self.update_log.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(
+                [
+                    "step",
+                    "discarded_group_fraction",
+                    "mixed_group_fraction",
+                    "mean_successes_per_group",
+                    "mean_policy_entropy",
+                    "kept_steps",
+                    "used_dynamic_fallback",
+                    "loss",
+                    "grad_norm",
+                ]
+            )
+
+    def _log_update(self, global_step: int, rollout: dict[str, torch.Tensor], update_stats: dict[str, float]) -> None:
+        group_total = float(rollout["group_total"].item())
+        group_discarded = float(rollout["group_discarded"].item())
+        group_mixed = float(rollout["group_mixed"].item())
+        group_successes = rollout["group_successes"]
+        discarded_fraction = group_discarded / group_total if group_total else 0.0
+        mixed_fraction = group_mixed / group_total if group_total else 0.0
+        mean_successes = float(group_successes.mean().item()) if group_successes.numel() else 0.0
+        entropy = rollout["entropy"]
+        mean_entropy = float(entropy.mean().item()) if entropy.numel() else math.nan
+        row = [
+            global_step,
+            discarded_fraction,
+            mixed_fraction,
+            mean_successes,
+            mean_entropy,
+            int(rollout["obs"].shape[0]),
+            int(float(rollout.get("used_dynamic_fallback", torch.tensor(0.0, device=self.device)).item())),
+            update_stats.get("loss", math.nan),
+            update_stats.get("grad_norm", math.nan),
+        ]
+        self._append_rows(self.update_log, [row])
 
     @staticmethod
     def _append_rows(path: Path, rows: list[list[object]]) -> None:
