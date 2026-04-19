@@ -18,6 +18,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-steps", type=int, default=TrainConfig().total_steps)
     parser.add_argument("--ac-loss-temperature", type=float, default=TrainConfig().ac_loss_temperature)
     parser.add_argument("--certainty-min-gate", type=float, default=TrainConfig().certainty_min_gate)
+    parser.add_argument("--grouped-rollouts", action="store_true", default=TrainConfig().grouped_rollouts)
+    parser.add_argument("--dynamic-sampling", action="store_true", default=TrainConfig().dynamic_sampling)
+    parser.add_argument("--group-size", type=int, default=TrainConfig().group_size)
+    parser.add_argument("--rollout-temperature", type=float, default=TrainConfig().rollout_temperature)
+    parser.add_argument("--dynamic-sampling-warmup-steps", type=int, default=TrainConfig().dynamic_sampling_warmup_steps)
     parser.add_argument("--pretrained-policy-path", default=TrainConfig().pretrained_policy_path)
     parser.add_argument("--freeze-pretrained-policy", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -31,6 +36,11 @@ def main() -> None:
         total_steps=args.total_steps,
         ac_loss_temperature=args.ac_loss_temperature,
         certainty_min_gate=args.certainty_min_gate,
+        grouped_rollouts=args.grouped_rollouts,
+        dynamic_sampling=args.dynamic_sampling,
+        group_size=args.group_size,
+        rollout_temperature=args.rollout_temperature,
+        dynamic_sampling_warmup_steps=args.dynamic_sampling_warmup_steps,
         pretrained_policy_path=args.pretrained_policy_path,
         freeze_pretrained_policy=args.freeze_pretrained_policy,
     )

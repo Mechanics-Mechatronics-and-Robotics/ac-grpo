@@ -14,6 +14,7 @@ from torch import nn
 
 from src.config import CHECKPOINT_DIR, LOG_DIR, TrainConfig, ensure_output_dirs
 from src.env import LunarLanderDiagnosticEnv
+from src.evaluation import evaluate_policy_checkpoint
 from src.policy_net import PolicyNet
 
 
@@ -71,6 +72,8 @@ class PPOBaselineTrainer:
         episode_return = 0.0
         episode_length = 0
         episode_id = 0
+        next_checkpoint_step = self.config.checkpoint_interval
+        saved_checkpoints: list[Path] = []
         while global_step < self.config.total_steps:
             step_budget = self.config.total_steps - global_step
             dynamic_sampling_active = self.config.dynamic_sampling and global_step >= self.config.dynamic_sampling_warmup_steps
@@ -95,8 +98,20 @@ class PPOBaselineTrainer:
             self._log_update(global_step, rollout, update_stats)
             if rollout["rewards"].numel() and not math.isfinite(float(rollout["rewards"].mean())):
                 raise FloatingPointError("NaN detected in rollout rewards")
-        torch.save(self.policy.state_dict(), self.checkpoint_dir / f"{self.run_id}.pt")
-        summary = {"method": "BASELINE", "mode": self.mode, "seed": self.seed, "total_steps": global_step}
+            while global_step >= next_checkpoint_step:
+                saved_checkpoints.append(self._save_checkpoint(next_checkpoint_step))
+                next_checkpoint_step += self.config.checkpoint_interval
+        final_checkpoint = self._save_checkpoint(global_step, suffix="final")
+        saved_checkpoints.append(final_checkpoint)
+        eval_rows = self._evaluate_checkpoints(saved_checkpoints)
+        best_eval = max(eval_rows, key=lambda row: float(row["eval_return_mean"])) if eval_rows else {}
+        summary = {
+            "method": "BASELINE",
+            "mode": self.mode,
+            "seed": self.seed,
+            "total_steps": global_step,
+            "best_checkpoint_by_eval_return": best_eval,
+        }
         summary_with_config = {
             **summary,
             "config": asdict(self.config),
@@ -438,3 +453,16 @@ class PPOBaselineTrainer:
             "pretrained_policy_path": self.config.pretrained_policy_path,
             "freeze_pretrained_policy": self.config.freeze_pretrained_policy,
         }
+
+    def _save_checkpoint(self, step: int, suffix: str | None = None) -> Path:
+        label = suffix or f"step{step:07d}"
+        path = self.checkpoint_dir / f"{self.run_id}_{label}.pt"
+        torch.save(self.policy.state_dict(), path)
+        return path
+
+    def _evaluate_checkpoints(self, checkpoints: list[Path]) -> list[dict[str, object]]:
+        eval_path = self.log_dir / f"{self.run_id}_checkpoint_eval.csv"
+        return [
+            evaluate_policy_checkpoint(path, self.mode, self.config, self.device, eval_path)
+            for path in checkpoints
+        ]

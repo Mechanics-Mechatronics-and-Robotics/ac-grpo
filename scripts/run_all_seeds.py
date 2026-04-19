@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from src.config import BASELINE_EXPERIMENTS, DEFAULT_PRETRAINED_POLICY, METHOD_MODE_EXPERIMENTS, OUTPUTS_DIR, SEEDS
+from src.config import BASELINE_EXPERIMENTS, DEFAULT_PRETRAINED_POLICY, FINAL_EXPERIMENT_GRID, METHOD_MODE_EXPERIMENTS, OUTPUTS_DIR, SEEDS
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
 
 def selected_experiments(args: argparse.Namespace) -> list[str]:
     if args.all:
-        return list(METHOD_MODE_EXPERIMENTS)
+        return list(FINAL_EXPERIMENT_GRID)
     if args.experiment is None:
         raise SystemExit("Provide --experiment NAME or --all.")
     return [args.experiment]
@@ -69,9 +69,30 @@ def summarize_seed(seed_dir: Path, seed: int) -> dict[str, float | int]:
             row["discarded_group_fraction_mean"] = sum(float(r["discarded_group_fraction"]) for r in updates) / len(updates)
             row["mixed_group_fraction_mean"] = sum(float(r["mixed_group_fraction"]) for r in updates) / len(updates)
             row["mean_successes_per_group"] = sum(float(r["mean_successes_per_group"]) for r in updates) / len(updates)
-            row["policy_entropy_mean"] = sum(float(r["mean_policy_entropy"]) for r in updates if r["mean_policy_entropy"] != "nan") / max(
-                1, sum(1 for r in updates if r["mean_policy_entropy"] != "nan")
-            )
+            if "mean_policy_entropy" in updates[0]:
+                valid_entropy = [float(r["mean_policy_entropy"]) for r in updates if r["mean_policy_entropy"] != "nan"]
+                row["policy_entropy_mean"] = sum(valid_entropy) / max(1, len(valid_entropy))
+    eval_paths = list((seed_dir / "logs").glob("*_checkpoint_eval.csv"))
+    if eval_paths:
+        with eval_paths[0].open("r", newline="", encoding="utf-8") as f:
+            eval_rows = list(csv.DictReader(f))
+        if eval_rows:
+            by_checkpoint: dict[str, list[dict[str, str]]] = {}
+            for eval_row in eval_rows:
+                by_checkpoint.setdefault(eval_row["checkpoint"], []).append(eval_row)
+            best_name = ""
+            best_return = float("-inf")
+            best_success = 0.0
+            for checkpoint, rows in by_checkpoint.items():
+                mean_return = sum(float(r["return"]) for r in rows) / len(rows)
+                mean_success = sum(float(r["success"]) for r in rows) / len(rows)
+                if mean_return > best_return:
+                    best_name = checkpoint
+                    best_return = mean_return
+                    best_success = mean_success
+            row["best_eval_return"] = best_return
+            row["best_eval_success"] = best_success
+            row["best_eval_checkpoint"] = best_name
     return row
 
 
@@ -103,7 +124,13 @@ def run_one_experiment(
     run_dir = parent_dir / experiment_name
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "plots").mkdir()
-    config_payload = {"experiment": experiment_name, "seeds": list(seeds), **settings}
+    config_payload = {
+        "experiment": experiment_name,
+        "seeds": list(seeds),
+        "pretrained_policy_path": pretrained_policy_path,
+        "freeze_pretrained_policy": freeze_pretrained_policy,
+        **settings,
+    }
     write_yaml(run_dir / "config.yaml", config_payload)
     for seed in seeds:
         if method == "BASELINE":
@@ -151,11 +178,21 @@ def run_one_experiment(
                 str(seed),
                 "--total-steps",
                 str(settings["total_steps"]),
+                "--group-size",
+                str(settings.get("group_size", 4)),
+                "--rollout-temperature",
+                str(settings["rollout_temperature"]),
+                "--dynamic-sampling-warmup-steps",
+                str(settings.get("dynamic_sampling_warmup_steps", 0)),
                 "--output-dir",
                 str(run_dir),
                 "--run-name",
                 method,
             ]
+            if settings["grouped_rollouts"]:
+                command.append("--grouped-rollouts")
+            if settings["dynamic_sampling"]:
+                command.append("--dynamic-sampling")
             if pretrained_policy_path:
                 command.extend(["--pretrained-policy-path", pretrained_policy_path])
             if freeze_pretrained_policy:
@@ -192,7 +229,7 @@ def main() -> None:
             repo,
             seeds,
             args.total_steps,
-            analyze_single=not args.all,
+            analyze_single=True,
             pretrained_policy_path=args.pretrained_policy_path,
             freeze_pretrained_policy=args.freeze_pretrained_policy,
         )

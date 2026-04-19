@@ -7,6 +7,17 @@ from pathlib import Path
 SEEDS = (42, 0, 17, 9, 3)
 MODES = ("CLEAN", "REWARD_NOISE", "OBS_NOISE")
 METHODS = ("BASELINE", "AC_LITE", "AC_FULL")
+FINAL_EXPERIMENT_GRID = (
+    "baseline_clean",
+    "baseline_obs_noise",
+    "baseline_reward_noise",
+    "ac_lite_clean",
+    "ac_lite_obs_noise",
+    "ac_lite_reward_noise",
+    "ac_full_clean",
+    "ac_full_obs_noise",
+    "ac_full_reward_noise",
+)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OUTPUTS_DIR = REPO_ROOT / "outputs"
 LOG_DIR = OUTPUTS_DIR / "logs"
@@ -20,8 +31,8 @@ BEST_EXPERIMENT_SETTINGS = {
     "rollout_temperature": 1.0,
     "epsilon_low": 0.2,
     "epsilon_high": 0.2,
-    "total_steps": 900_000,
-    "dynamic_sampling_warmup_steps": 50_000,
+    "total_steps": 500_000,
+    "dynamic_sampling_warmup_steps": 10_000,
 }
 BEST_BASELINE_REPAIR = BEST_EXPERIMENT_SETTINGS
 BASELINE_EXPERIMENTS = {
@@ -47,7 +58,7 @@ class TrainConfig:
     steps_per_update: int = 2048
     batch_size: int = 64
     total_steps: int = 60_000
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
@@ -68,6 +79,9 @@ class TrainConfig:
     certainty_min_gate: float = 0.3
     pretrained_policy_path: str | None = str(DEFAULT_PRETRAINED_POLICY)
     freeze_pretrained_policy: bool = False
+    checkpoint_interval: int = 10_000
+    eval_seeds: tuple[int, ...] = (101, 102, 103)
+    eval_episodes_per_seed: int = 5
     grouped_rollouts: bool = True
     dynamic_sampling: bool = True
     group_size: int = 4

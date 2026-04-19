@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
 def parse_run_name(path: Path) -> tuple[str, str, int]:
     # Python 3.7 compatibility: str.removesuffix was added in Python 3.9
     stem = path.stem
-    for suffix in ("_episodes", "_steps"):
+    for suffix in ("_checkpoint_eval", "_episodes", "_steps"):
         if stem.endswith(suffix):
             stem = stem[: -len(suffix)]
     prefix, seed_part = stem.rsplit("_seed", 1)
@@ -66,6 +66,16 @@ def load_logs(log_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     episodes = pd.concat(episode_frames, ignore_index=True) if episode_frames else pd.DataFrame()
     steps = pd.concat(step_frames, ignore_index=True) if step_frames else pd.DataFrame()
     return episodes, steps
+
+
+def load_eval_logs(log_dir: Path) -> pd.DataFrame:
+    frames = []
+    for path in log_dir.rglob("*_checkpoint_eval.csv"):
+        df = pd.read_csv(path)
+        method, mode, seed = parse_run_name(path)
+        df["method"], df["mode"], df["seed"] = method, mode, seed
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def rolling_mean(series: pd.Series, window: int = 20) -> pd.Series:
@@ -151,7 +161,9 @@ def save_return_vs_steps(episodes: pd.DataFrame, plot_dir: Path) -> None:
     plt.xlabel("steps")
     plt.ylabel("return")
     plt.title("Return vs steps")
-    plt.legend(fontsize=8)
+    handles, labels = plt.gca().get_legend_handles_labels()
+    if handles:
+        plt.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(plot_dir / "01_return_vs_steps.png")
     plt.close()
@@ -170,7 +182,9 @@ def save_success_vs_steps(episodes: pd.DataFrame, plot_dir: Path) -> None:
     plt.xlabel("steps")
     plt.ylabel("success rate")
     plt.title("Success rate vs steps")
-    plt.legend(fontsize=8)
+    handles, labels = plt.gca().get_legend_handles_labels()
+    if handles:
+        plt.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(plot_dir / "02_success_rate_vs_steps.png")
     plt.close()
@@ -198,7 +212,13 @@ def save_metric_by_mode_subplots(episodes: pd.DataFrame, y_col: str, ylabel: str
         ax.set_xlabel("steps")
         ax.grid(alpha=0.25)
     axes[0].set_ylabel(ylabel)
-    axes[-1].legend(fontsize=8)
+    handles, labels = [], []
+    for ax in axes:
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            break
+    if handles:
+        axes[-1].legend(handles, labels, fontsize=8)
     fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(plot_dir / filename)
@@ -238,6 +258,8 @@ def _compute_auc_tables(episodes: pd.DataFrame, steps: pd.DataFrame) -> tuple[pd
     cert_steps = steps.copy()
     cert_steps["certainty"] = pd.to_numeric(cert_steps["certainty"], errors="coerce")
     cert_steps = cert_steps.dropna(subset=["certainty"])
+    if cert_steps.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
     means = (
         cert_steps.groupby(["method", "mode", "seed", "episode_id"])["certainty"]
@@ -249,27 +271,23 @@ def _compute_auc_tables(episodes: pd.DataFrame, steps: pd.DataFrame) -> tuple[pd
         on=["method", "mode", "seed", "episode_id"],
         how="inner",
     )
+    if merged.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
-    traj = (
-        merged.groupby(["method", "mode"])
-        .apply(lambda g: safe_auroc(g["success"], g["mean_certainty"]))
-        .to_frame("trajectory_auroc")
-        .reset_index()
-    )
+    traj_series = merged.groupby(["method", "mode"]).apply(lambda g: safe_auroc(g["success"], g["mean_certainty"]))
+    traj = traj_series.to_frame("trajectory_auroc").reset_index()
 
     late = cert_steps.merge(
         episodes[["method", "mode", "seed", "episode_id", "episode_length"]],
         on=["method", "mode", "seed", "episode_id"],
         how="inner",
     )
+    if late.empty:
+        return traj, pd.DataFrame()
     late["late_phase"] = pd.to_numeric(late["timestep"], errors="coerce") > 0.8 * pd.to_numeric(late["episode_length"], errors="coerce")
 
-    step = (
-        late.groupby(["method", "mode"])
-        .apply(lambda g: safe_auroc(g["late_phase"], 1.0 - g["certainty"]))
-        .to_frame("timestep_auroc")
-        .reset_index()
-    )
+    step_series = late.groupby(["method", "mode"]).apply(lambda g: safe_auroc(g["late_phase"], 1.0 - g["certainty"]))
+    step = step_series.to_frame("timestep_auroc").reset_index()
     return traj, step
 
 
@@ -332,6 +350,7 @@ def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, report_dir: Path) 
 
     traj_auc, step_auc = _compute_auc_tables(episodes, steps)
     per_seed, agg = _compute_episode_tables(episodes, last_n=20)
+    evals = load_eval_logs(report_dir)
 
     if not agg.empty:
         lines += [
@@ -433,6 +452,34 @@ def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, report_dir: Path) 
                     seed=int(r["seed"]),
                     ret=float(r["final_return_mean"]),
                     succ=float(r["final_success_mean"]),
+                )
+            )
+        report.append("")
+
+    if not evals.empty:
+        eval_summary = (
+            evals.groupby(["method", "mode", "seed", "checkpoint"])
+            .agg(eval_return=("return", "mean"), eval_success=("success", "mean"), eval_length=("episode_length", "mean"))
+            .reset_index()
+        )
+        best_rows = eval_summary.sort_values("eval_return", ascending=False).groupby(["method", "mode", "seed"]).head(1)
+        report += [
+            "## Best checkpoint by greedy held-out evaluation",
+            "",
+            "Checkpoints are evaluated greedily on fixed held-out seeds. The final checkpoint is not assumed to be best.",
+            "",
+            "| mode | method | seed | checkpoint | eval return | eval success |",
+            "|---|---|---:|---|---:|---:|",
+        ]
+        for _, r in best_rows.sort_values(["mode", "method", "seed"]).iterrows():
+            report.append(
+                "| {mode} | {method} | {seed} | {checkpoint} | {ret:.1f} | {succ:.3f} |".format(
+                    mode=r["mode"],
+                    method=r["method"],
+                    seed=int(r["seed"]),
+                    checkpoint=r["checkpoint"],
+                    ret=float(r["eval_return"]),
+                    succ=float(r["eval_success"]),
                 )
             )
         report.append("")
