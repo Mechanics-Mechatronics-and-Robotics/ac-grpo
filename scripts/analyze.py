@@ -176,6 +176,35 @@ def save_success_vs_steps(episodes: pd.DataFrame, plot_dir: Path) -> None:
     plt.close()
 
 
+def save_metric_by_mode_subplots(episodes: pd.DataFrame, y_col: str, ylabel: str, title: str, filename: str, plot_dir: Path) -> None:
+    modes = ("CLEAN", "OBS_NOISE", "REWARD_NOISE")
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+    for ax, mode in zip(axes, modes):
+        mode_df = episodes[episodes["mode"] == mode]
+        for method, group in mode_df.groupby("method"):
+            x, mean, std = _seed_mean_curve(group, y_col, window=20, grid_points=250)
+            if len(x) == 0:
+                continue
+            color = _method_color(method)
+            ax.plot(x, mean, label=method, color=color)
+            if y_col == "success":
+                lower = np.clip(mean - std, 0.0, 1.0)
+                upper = np.clip(mean + std, 0.0, 1.0)
+            else:
+                lower = mean - std
+                upper = mean + std
+            ax.fill_between(x, lower, upper, color=color, alpha=0.15)
+        ax.set_title(mode)
+        ax.set_xlabel("steps")
+        ax.grid(alpha=0.25)
+    axes[0].set_ylabel(ylabel)
+    axes[-1].legend(fontsize=8)
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(plot_dir / filename)
+    plt.close(fig)
+
+
 def save_certainty_histogram(steps: pd.DataFrame, plot_dir: Path) -> None:
     data = pd.to_numeric(steps["certainty"], errors="coerce").dropna()
     plt.figure(figsize=(8, 6))
@@ -199,26 +228,6 @@ def save_scatter(steps: pd.DataFrame, x: str, y: str, filename: str, title: str,
     plt.title(title)
     plt.tight_layout()
     plt.savefig(plot_dir / filename)
-    plt.close()
-
-
-def save_clean_vs_noisy_return(episodes: pd.DataFrame, plot_dir: Path) -> None:
-    plt.figure(figsize=(10, 6))
-    noisy = episodes[episodes["mode"].isin(["CLEAN", "REWARD_NOISE", "OBS_NOISE"])].copy()
-    for (method, mode), group in noisy.groupby(["method", "mode"]):
-        x, mean, std = _seed_mean_curve(group, "return", window=20, grid_points=250)
-        if len(x) == 0:
-            continue
-        label = f"{method} {mode}"
-        color = _method_color(method)
-        plt.plot(x, mean, label=label, color=color, linestyle=_mode_linestyle(mode))
-        plt.fill_between(x, mean - std, mean + std, color=color, alpha=0.15)
-    plt.xlabel("steps")
-    plt.ylabel("return")
-    plt.title("Clean vs noisy return comparison")
-    plt.legend(fontsize=8)
-    plt.tight_layout()
-    plt.savefig(plot_dir / "06_clean_vs_noisy_return_comparison.png")
     plt.close()
 
 
@@ -374,9 +383,13 @@ def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, report_dir: Path) 
         "",
         "This report summarizes the selected sweep from the CSV logs.",
         "",
+        f"Source folder: `{report_dir}`",
+        "",
+        "Reproducibility files: `config.yaml`, `summary.json`, per-seed `*_summary.json`, and per-seed CSV logs are generated with each run. Git tracks only `report.md` by default; generated logs/checkpoints/plots are ignored.",
+        "",
         "## Notes on experimental modes",
         "",
-        "- **REWARD_NOISE**: only corrupts the *logged success label* (false negatives). The environment reward signal used by PPO is unchanged.",
+        "- **REWARD_NOISE**: false-negative successes also penalize the terminal rollout reward used by PPO/GAE, so the policy update sees the corruption.",
         "- **OBS_NOISE**: adds Gaussian noise \(\\sigma=0.1\\) to observations at every step.",
         "",
         "## Seed aggregation",
@@ -458,7 +471,8 @@ def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, report_dir: Path) 
         "3. `03_certainty_histogram.png`",
         "4. `04_certainty_vs_entropy_scatter.png`",
         "5. `05_certainty_vs_delta_t_scatter.png`",
-        "6. `06_clean_vs_noisy_return_comparison.png`",
+        "6. `06_return_by_mode_subplots.png`",
+        "7. `07_success_by_mode_subplots.png`",
         "",
     ]
     (report_dir / "report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
@@ -473,11 +487,12 @@ def main() -> None:
         raise SystemExit(f"No episode logs found in {args.log_dir}")
     save_return_vs_steps(episodes, args.plot_dir)
     save_success_vs_steps(episodes, args.plot_dir)
+    save_metric_by_mode_subplots(episodes, "return", "return", "Return vs steps by mode", "06_return_by_mode_subplots.png", args.plot_dir)
+    save_metric_by_mode_subplots(episodes, "success", "success rate", "Success rate vs steps by mode", "07_success_by_mode_subplots.png", args.plot_dir)
     if not steps.empty and "certainty" in steps:
         save_certainty_histogram(steps, args.plot_dir)
         save_scatter(steps, "entropy", "certainty", "04_certainty_vs_entropy_scatter.png", "Certainty vs entropy scatter", args.plot_dir)
         save_scatter(steps, "delta", "certainty", "05_certainty_vs_delta_t_scatter.png", "Certainty vs delta_t scatter", args.plot_dir)
-    save_clean_vs_noisy_return(episodes, args.plot_dir)
     write_report(episodes, steps, args.log_dir)
 
 

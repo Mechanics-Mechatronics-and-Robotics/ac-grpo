@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon-high", type=float, default=TrainConfig().epsilon_high)
     parser.add_argument("--dynamic-sampling-warmup-steps", type=int, default=TrainConfig().dynamic_sampling_warmup_steps)
     parser.add_argument("--strict-dynamic-sampling", action="store_true")
+    parser.add_argument("--pretrained-policy-path", default=TrainConfig().pretrained_policy_path)
+    parser.add_argument("--freeze-pretrained-policy", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--run-name", default="BASELINE")
     return parser.parse_args()
@@ -40,6 +42,8 @@ def main() -> None:
         epsilon_high=args.epsilon_high,
         dynamic_sampling_warmup_steps=args.dynamic_sampling_warmup_steps,
         dynamic_sampling_fallback_on_empty=not args.strict_dynamic_sampling,
+        pretrained_policy_path=args.pretrained_policy_path,
+        freeze_pretrained_policy=args.freeze_pretrained_policy,
     )
     summary = PPOBaselineTrainer(
         mode=args.mode,

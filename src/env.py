@@ -12,6 +12,8 @@ import numpy as np
 class EpisodeOutcome:
     raw_success: int
     logged_success: int
+    policy_success: int
+    reward_was_corrupted: int
 
 
 class LunarLanderDiagnosticEnv:
@@ -50,9 +52,16 @@ class LunarLanderDiagnosticEnv:
     def episode_outcome(self, episode_return: float, info: dict[str, Any] | None = None) -> EpisodeOutcome:
         raw_success = int(bool(info and info.get("is_success", False)) or episode_return >= 200.0)
         logged_success = raw_success
+        reward_was_corrupted = 0
         if self.mode == "REWARD_NOISE" and raw_success == 1 and self.py_rng.random() < self.reward_noise_p:
             logged_success = 0
-        return EpisodeOutcome(raw_success=raw_success, logged_success=logged_success)
+            reward_was_corrupted = 1
+        return EpisodeOutcome(
+            raw_success=raw_success,
+            logged_success=logged_success,
+            policy_success=logged_success,
+            reward_was_corrupted=reward_was_corrupted,
+        )
 
     def _maybe_corrupt_obs(self, obs: np.ndarray) -> np.ndarray:
         obs_array = np.asarray(obs, dtype=np.float32)

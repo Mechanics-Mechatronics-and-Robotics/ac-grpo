@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from src.config import BASELINE_EXPERIMENTS, METHOD_MODE_EXPERIMENTS, OUTPUTS_DIR, SEEDS
+from src.config import BASELINE_EXPERIMENTS, DEFAULT_PRETRAINED_POLICY, METHOD_MODE_EXPERIMENTS, OUTPUTS_DIR, SEEDS
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,6 +19,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", choices=tuple(experiments), default=None)
     parser.add_argument("--all", action="store_true", help="Run the full method x mode matrix and make one combined report.")
     parser.add_argument("--total-steps", type=int, default=None, help="Override the experiment default.")
+    parser.add_argument("--pretrained-policy-path", default=str(DEFAULT_PRETRAINED_POLICY))
+    parser.add_argument("--freeze-pretrained-policy", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="Run seed 42 only.")
     return parser.parse_args()
 
@@ -90,6 +92,8 @@ def run_one_experiment(
     seeds: tuple[int, ...],
     total_steps_override: int | None,
     analyze_single: bool,
+    pretrained_policy_path: str | None,
+    freeze_pretrained_policy: bool,
 ) -> Path:
     experiments = {**BASELINE_EXPERIMENTS, **METHOD_MODE_EXPERIMENTS}
     settings = dict(experiments[experiment_name])
@@ -127,6 +131,10 @@ def run_one_experiment(
                 "--run-name",
                 "BASELINE",
             ]
+            if pretrained_policy_path:
+                command.extend(["--pretrained-policy-path", pretrained_policy_path])
+            if freeze_pretrained_policy:
+                command.append("--freeze-pretrained-policy")
             if settings["grouped_rollouts"]:
                 command.append("--grouped-rollouts")
             if settings["dynamic_sampling"]:
@@ -148,6 +156,10 @@ def run_one_experiment(
                 "--run-name",
                 method,
             ]
+            if pretrained_policy_path:
+                command.extend(["--pretrained-policy-path", pretrained_policy_path])
+            if freeze_pretrained_policy:
+                command.append("--freeze-pretrained-policy")
         run_command(command, repo)
     aggregate_rows = write_aggregate(run_dir, seeds)
     summary = {"experiment": experiment_name, "run_dir": str(run_dir), "seeds": list(seeds), "settings": settings, "aggregate": aggregate_rows}
@@ -166,9 +178,33 @@ def main() -> None:
     label = "all_experiments" if args.all else names[0]
     parent_dir = OUTPUTS_DIR / f"{stamp}_{label}"
     parent_dir.mkdir(parents=True, exist_ok=False)
-    write_yaml(parent_dir / "config.yaml", {"experiments": names, "seeds": list(seeds), "total_steps_override": args.total_steps})
-    run_dirs = [run_one_experiment(name, parent_dir, repo, seeds, args.total_steps, analyze_single=not args.all) for name in names]
-    summary = {"experiments": names, "run_dirs": [str(path) for path in run_dirs], "seeds": list(seeds)}
+    write_yaml(parent_dir / "config.yaml", {
+        "experiments": names,
+        "seeds": list(seeds),
+        "total_steps_override": args.total_steps,
+        "pretrained_policy_path": args.pretrained_policy_path,
+        "freeze_pretrained_policy": args.freeze_pretrained_policy,
+    })
+    run_dirs = [
+        run_one_experiment(
+            name,
+            parent_dir,
+            repo,
+            seeds,
+            args.total_steps,
+            analyze_single=not args.all,
+            pretrained_policy_path=args.pretrained_policy_path,
+            freeze_pretrained_policy=args.freeze_pretrained_policy,
+        )
+        for name in names
+    ]
+    summary = {
+        "experiments": names,
+        "run_dirs": [str(path) for path in run_dirs],
+        "seeds": list(seeds),
+        "pretrained_policy_path": args.pretrained_policy_path,
+        "freeze_pretrained_policy": args.freeze_pretrained_policy,
+    }
     (parent_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     run_command([sys.executable, "scripts/analyze.py", "--log-dir", str(parent_dir), "--plot-dir", str(parent_dir / "plots")], repo)
 

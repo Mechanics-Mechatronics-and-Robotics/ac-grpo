@@ -39,38 +39,6 @@ Methods:
 
 ---
 
-## Best Baseline Settings
-
-Use the repaired baseline settings unless an experiment explicitly overrides them:
-
-```python
-{
-    "dynamic_sampling": True,
-    "grouped_rollouts": True,
-    "rollout_temperature": 1.0,
-    "epsilon_low": 0.2,
-    "epsilon_high": 0.2,
-    "total_steps": 60_000,
-    "dynamic_sampling_warmup_steps": 150_000,
-}
-```
-
-Note: if `total_steps < dynamic_sampling_warmup_steps`, dynamic sampling will not activate in that run. This is acceptable for short smoke/debug runs, but should be checked before final claims.
-
----
-
-## Training Defaults
-
-Steps per update: 2048  
-Batch size: 64  
-Optimizer: Adam  
-Learning rate: 3e-4  
-Gamma: 0.99  
-Lambda: 0.95  
-Clip default: low=0.2, high=0.2  
-
----
-
 ## Metrics
 
 Episode-level:
@@ -104,8 +72,8 @@ Each `run_all_seeds.py` launch must create exactly one folder in `outputs/`.
 Inside it store:
 
 - config.yaml
-- summary.json
 - aggregate_metrics.csv
+- report.md
 - plots/
 - seed_42/
 - seed_0/

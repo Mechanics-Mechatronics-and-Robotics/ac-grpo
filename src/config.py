@@ -12,6 +12,8 @@ OUTPUTS_DIR = REPO_ROOT / "outputs"
 LOG_DIR = OUTPUTS_DIR / "logs"
 PLOT_DIR = OUTPUTS_DIR / "plots"
 CHECKPOINT_DIR = OUTPUTS_DIR / "checkpoints"
+PRETRAINED_DIR = REPO_ROOT / "pretrained_models"
+DEFAULT_PRETRAINED_POLICY = PRETRAINED_DIR / "lunarlander_baseline_clean_seed42.pt"
 BEST_EXPERIMENT_SETTINGS = {
     "dynamic_sampling": True,
     "grouped_rollouts": True,
@@ -19,7 +21,7 @@ BEST_EXPERIMENT_SETTINGS = {
     "epsilon_low": 0.2,
     "epsilon_high": 0.2,
     "total_steps": 900_000,
-    "dynamic_sampling_warmup_steps": 300_000,
+    "dynamic_sampling_warmup_steps": 50_000,
 }
 BEST_BASELINE_REPAIR = BEST_EXPERIMENT_SETTINGS
 BASELINE_EXPERIMENTS = {
@@ -63,6 +65,9 @@ class TrainConfig:
     alpha: float = 1.0
     beta: float = 1.0
     ac_loss_temperature: float = 1.0
+    certainty_min_gate: float = 0.3
+    pretrained_policy_path: str | None = str(DEFAULT_PRETRAINED_POLICY)
+    freeze_pretrained_policy: bool = False
     grouped_rollouts: bool = True
     dynamic_sampling: bool = True
     group_size: int = 4
@@ -73,5 +78,5 @@ class TrainConfig:
 
 
 def ensure_output_dirs() -> None:
-    for path in (LOG_DIR, PLOT_DIR, CHECKPOINT_DIR):
+    for path in (LOG_DIR, PLOT_DIR, CHECKPOINT_DIR, PRETRAINED_DIR):
         path.mkdir(parents=True, exist_ok=True)

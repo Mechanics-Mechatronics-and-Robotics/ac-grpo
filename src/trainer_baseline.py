@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import platform
 import random
 from dataclasses import asdict
 from pathlib import Path
@@ -47,6 +48,7 @@ class PPOBaselineTrainer:
             obs_noise_sigma=self.config.obs_noise_sigma,
         )
         self.policy = PolicyNet(self.config.obs_size, self.config.action_size, self.config.hidden_size).to(self.device)
+        self._load_pretrained_policy()
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.config.learning_rate)
         self.run_id = f"{run_name}_{mode}_seed{seed}"
         if output_dir is None:
@@ -95,7 +97,12 @@ class PPOBaselineTrainer:
                 raise FloatingPointError("NaN detected in rollout rewards")
         torch.save(self.policy.state_dict(), self.checkpoint_dir / f"{self.run_id}.pt")
         summary = {"method": "BASELINE", "mode": self.mode, "seed": self.seed, "total_steps": global_step}
-        summary_with_config = {**summary, "config": asdict(self.config)}
+        summary_with_config = {
+            **summary,
+            "config": asdict(self.config),
+            "runtime": self._runtime_metadata(),
+            "reward_noise_semantics": "REWARD_NOISE penalizes the terminal rollout reward used by GAE for false-negative successes.",
+        }
         self.summary_log.write_text(json.dumps(summary_with_config, indent=2), encoding="utf-8")
         self.env.close()
         return summary
@@ -131,6 +138,8 @@ class PPOBaselineTrainer:
             obs = next_obs
             if done:
                 outcome = self.env.episode_outcome(episode_return, info)
+                if outcome.reward_was_corrupted:
+                    rewards[-1] = rewards[-1] - 200.0
                 episode_rows.append([global_step, episode_id, episode_return, outcome.logged_success, outcome.raw_success, episode_length])
                 obs, _ = self.env.reset()
                 episode_return = 0.0
@@ -240,6 +249,8 @@ class PPOBaselineTrainer:
                     global_step += 1
                     obs = next_obs
                 outcome = self.env.episode_outcome(episode_return, info)
+                if outcome.reward_was_corrupted:
+                    group_steps[-1]["reward"] = float(group_steps[-1]["reward"]) - 200.0
                 for idx in range(episode_start, len(group_steps)):
                     group_steps[idx]["episode_success"] = float(outcome.logged_success)
                 group_successes.append(outcome.logged_success)
@@ -408,3 +419,22 @@ class PPOBaselineTrainer:
         if rows:
             with path.open("a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerows(rows)
+
+    def _load_pretrained_policy(self) -> None:
+        if not self.config.pretrained_policy_path:
+            return
+        state = torch.load(Path(self.config.pretrained_policy_path), map_location=self.device)
+        self.policy.load_state_dict(state)
+        if self.config.freeze_pretrained_policy:
+            for parameter in self.policy.parameters():
+                parameter.requires_grad_(False)
+
+    def _runtime_metadata(self) -> dict[str, object]:
+        return {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "torch": torch.__version__,
+            "device": str(self.device),
+            "pretrained_policy_path": self.config.pretrained_policy_path,
+            "freeze_pretrained_policy": self.config.freeze_pretrained_policy,
+        }
