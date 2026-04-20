@@ -1,15 +1,23 @@
-# AC-GRPO Methodology
+# AC-GRPO Methodology (Sparse Reward)
 
-This repository implements a `LunarLander-v2` diagnostic for **Alignment-Certainty Group Relative Policy Optimization (AC-GRPO)**. The goal is to study whether a learned per-timestep certainty signal can make policy optimization more robust when supervision is noisy or unreliable.
+This repository implements a `LunarLander-v2` diagnostic for **Alignment-Certainty Group Relative Policy Optimization (AC-GRPO)** under a sparse terminal reward regime.
 
-> **Note:** This document describes the method and training pipeline only. Experiment plans, run commands, and empirical results are intentionally kept out of this README and should be documented separately.
+The goal is to evaluate whether a learned per-timestep certainty signal can stabilize policy optimization and improve robustness when supervision is sparse, delayed, or unreliable.
 
-## Task Setting
+This diagnostic is designed as a controlled precursor to applying AC-style optimization to large-scale reinforcement learning systems such as vision-language-action (VLA) models.
+
+Note:  
+This document defines the training protocol and mathematical formulation only.  
+Experiment schedules, run commands, and empirical results must be documented separately.
+
+---
+
+# Task Setting
 
 The diagnostic environment is `LunarLander-v2` with a discrete action space.
 
 | Quantity | Value |
-|---|---:|
+|----------|------:|
 | Observation dimension | 8 |
 | Number of actions | 4 |
 | Max episode length | 1000 |
@@ -17,435 +25,455 @@ The diagnostic environment is `LunarLander-v2` with a discrete action space.
 
 Each episode produces a binary outcome:
 
-$$
-R_i \in \{0, 1\}
-$$
+R_i ∈ {0, 1}
 
-where `1` denotes a successful landing and `0` denotes failure.
+where:
 
-The pipeline supports three environment modes:
+1 — successful landing  
+0 — failure  
+
+This binary outcome is the only learning signal used for policy optimization.
+
+---
+
+# Sparse Reward Definition
+
+The training signal is a terminal-only binary reward.
+
+At each timestep:
+
+r_t^train = 0                      for t < T  
+r_T^train = 1                      if success  
+r_T^train = 0                      if failure  
+
+Therefore the episode return used by the optimizer is:
+
+G_i^train = R_i
+
+This definition is used identically for:
+
+- BASELINE  
+- AC_LITE  
+- AC_FULL  
+
+No reward shaping is applied.  
+No dense reward is used for learning.  
+
+This ensures strict comparability between methods.
+
+---
+
+# Environment Reward (Reporting Only)
+
+`LunarLander-v2` internally produces dense environment rewards:
+
+r_t^env
+
+These values are not used for policy optimization.
+
+They are retained only for reporting and diagnostics:
+
+G_i^env = Σ_t r_t^env
+
+This separation enables:
+
+- consistent sparse learning
+- interpretable performance metrics
+- stable comparison across methods
+- direct compatibility with binary-reward RL pipelines
+
+---
+
+# Noise Modes
+
+The pipeline supports three supervision conditions.
 
 | Mode | Description |
-|---|---|
-| `CLEAN` | No corruption. |
-| `REWARD_NOISE` | False-negative success corruption. Successful episodes may be mislabelled as failures for policy learning. |
-| `OBS_NOISE` | Gaussian observation noise is added to observations. |
+|------|------------|
+| CLEAN | No corruption |
+| REWARD_NOISE | Terminal success labels randomly flipped |
+| OBS_NOISE | Gaussian noise added to observations |
 
-For `REWARD_NOISE`, corruption is applied to the reward signal used by PPO/GAE rather than only to auxiliary logging labels. This is critical because the policy must experience the same noisy supervision that the method is designed to handle. In implementation, when a successful episode is flipped to a failure signal, the terminal rollout reward used for advantage estimation is modified before GAE computation.
+These modes simulate realistic deployment failures in robotics and VLA systems.
 
-## Reward and Return Calculation
+---
 
-The pipeline distinguishes between the raw environment reward used for reporting and the training reward used for policy optimization.
+# Reward Noise (Sparse Regime)
 
-At each step, `LunarLander-v2` emits the raw environment reward:
+Reward corruption applies only to terminal outcomes.
 
-$$
-r_t^{\text{env}}
-$$
+With probability:
 
-The logged episode return is the uncorrupted sum of raw environment rewards:
+p = 0.2
 
-$$
-G_i^{\text{env}} = \sum_t r_t^{\text{env}}
-$$
+a successful episode is converted into a failure label:
 
-This raw return is used for episode-level reporting and for computing the raw success indicator:
+R_i^policy = 0  
+even though  
+R_i^raw = 1  
 
-$$
-R_i^{\text{raw}} = \mathbb{1}[G_i^{\text{env}} \ge 200]
-$$
+Implementation:
 
-or the environment-provided success flag when available.
+if success and random() < p:
+    r_T_train = 0
 
-For `CLEAN` and `OBS_NOISE`, the training reward equals the raw environment reward:
+Earlier rewards remain:
 
-$$
-r_t^{\text{train}} = r_t^{\text{env}}
-$$
+r_t_train = 0    for t < T
 
-For `REWARD_NOISE`, only true successful episodes can be corrupted. With probability $p = 0.2$, a raw success is converted into a false-negative policy target:
+This ensures reward noise directly affects the policy gradient.
 
-$$
-R_i^{\text{policy}} = 0
-\quad \text{even though} \quad
-R_i^{\text{raw}} = 1
-$$
+---
 
-When this happens, the terminal transition reward stored in the rollout buffer is penalized before GAE is computed:
+# Observation Noise
 
-$$
-r_T^{\text{train}} = r_T^{\text{env}} - 200
-$$
+Observation corruption is applied at every timestep:
 
-All earlier rewards in the episode remain unchanged:
+s_t_tilde = s_t + ε_t
 
-$$
-r_t^{\text{train}} = r_t^{\text{env}}, \quad t < T
-$$
+where:
 
-The PPO/AC advantage estimator uses the training reward sequence:
+ε_t ~ Normal(0, σ² I)
 
-$$
-\hat{A}_t = \text{GAE}(r_t^{\text{train}}, V_\theta(s_t), \gamma, \lambda)
-$$
+Default:
 
-This means reward noise affects the actual policy gradient rather than only the logged success label. The raw return and raw success are still logged, so downstream analysis can compare true task performance against the noisy supervision seen by the optimizer.
+sigma = 0.1
 
-Dynamic sampling and AC outcome labels use the policy/logged outcome:
+Both policy and certainty networks receive corrupted observations.
 
-$$
-R_i^{\text{policy}}
-$$
+---
 
-while final evaluation reports raw greedy environment performance.
+# Methods
 
-## Methods
-
-The code compares three methods:
+The repository compares three training pipelines.
 
 | Method | Description |
-|---|---|
-| `BASELINE` | PPO-style policy optimization with a repaired sampling and clipping pipeline. |
-| `AC_LITE` | Baseline policy optimization plus certainty-gated advantages and alignment loss. |
-| `AC_FULL` | `AC_LITE` plus outcome loss and a discrete-action dispersion proxy. |
+|--------|------------|
+| BASELINE | PPO-style policy optimization |
+| AC_LITE | Certainty-gated advantages plus alignment loss |
+| AC_FULL | AC_LITE plus outcome and dispersion losses |
 
-The AC variants are intentionally small extensions of the baseline pipeline. The certainty head does not select actions and shares no parameters with the policy.
+The AC extensions are intentionally minimal.
 
-## Networks
+The policy architecture remains unchanged.
 
-The policy and certainty functions are implemented as independent MLPs.
+---
 
-**Policy network:**
-```
+# Network Architecture
+
+Policy and certainty networks are fully independent.
+
+Policy network:
+
 8 → 128 → 128 → 4
-```
 
-**Certainty network:**
-```
+Certainty network:
+
 8 → 128 → 128 → 1
-```
 
-Both use ReLU hidden activations. The policy produces a categorical action distribution over four discrete actions. The certainty network produces a scalar logit:
+Activation:
 
-$$
-u_t = f_\psi(s_t)
-$$
+ReLU
 
-and certainty is computed as:
+Policy output:
 
-$$
-c_t = \sigma(u_t)
-$$
+π_θ(a | s)
 
-The implementation clamps certainty to the range:
+Certainty output:
 
-$$
-c_t \in [10^{-6}, 1 - 10^{-6}]
-$$
+u_t = f_ψ(s_t)
 
-The policy and certainty networks are strictly isolated:
+c_t = sigmoid(u_t)
 
-$$
-s_t \rightarrow \pi_\theta(a \mid s_t) \quad \text{and} \quad s_t \rightarrow c_\psi(s_t)
-$$
+Certainty is clamped:
 
-No parameters are shared. This isolation prevents a degenerate solution where the policy could reduce its own training signal by jointly lowering action quality and certainty.
+c_t ∈ [1e-6, 1 - 1e-6]
 
-## Pretrained Policy Backbone
+No parameters are shared between policy and certainty networks.
 
-The current pipeline supports loading a pretrained policy checkpoint as the starting backbone for fine-tuning.
+This isolation prevents degenerate feedback loops where the policy suppresses its own learning signal.
 
-The default pretrained policy path is:
-```text
+---
+
+# Pretrained Policy Backbone
+
+Training may start from a pretrained policy checkpoint.
+
+Default:
+
 pretrained_models/lunarlander_baseline_clean_seed42.pt
-```
 
-This checkpoint is loaded into `PolicyNet` when `pretrained_policy_path` is specified in the config. The policy can be used in two ways:
+Two operating modes are supported.
 
-| Mode | Behavior |
-|---|---|
-| Fine-tuned policy | Load pretrained weights and continue updating policy parameters. |
-| Frozen policy | Load pretrained weights and freeze policy parameters while training auxiliary AC components. |
+Fine-tuned policy:
 
-The frozen-policy option is controlled by:
-```python
+Load pretrained weights and continue updating parameters.
+
+Frozen policy:
+
+Load pretrained weights and keep policy fixed while training certainty.
+
+Configuration:
+
 freeze_pretrained_policy: bool
-```
 
-This option is useful for separating two research questions:
-1. Whether the certainty model can learn meaningful reliability signals on top of a fixed policy.
-2. Whether certainty-gated policy optimization improves the policy when gradients are allowed to update the policy.
+This separation allows controlled investigation of two research questions:
 
-## Baseline Policy Optimization
+1) Can certainty learn meaningful reliability signals on top of a fixed policy?  
+2) Can certainty-gated optimization improve the policy itself?
 
-The baseline is a compact PPO-style trainer using the following defaults:
+---
 
-| Hyperparameter | Value |
-|---|---:|
-| Steps per update | 2048 |
-| Batch size | 64 |
-| Optimizer | Adam |
-| Learning rate | $3 \times 10^{-4}$ |
-| Discount ($\gamma$) | 0.99 |
-| GAE $\lambda$ | 0.95 |
-| Entropy coefficient | 0.01 |
-| Value coefficient | 0.5 |
-| Max gradient norm | 0.5 |
+# Baseline Policy Optimization
 
-The baseline uses Generalized Advantage Estimation (GAE):
+The baseline uses PPO with Generalized Advantage Estimation.
 
-$$
-\hat{A}_t = \text{GAE}(r_t, V_\theta(s_t), \gamma, \lambda)
-$$
+Default configuration:
 
-and PPO clipping:
+Steps per update: 2048  
+Batch size: 64  
+Optimizer: Adam  
+Learning rate: 3e-4  
+Discount γ: 0.99  
+GAE λ: 0.95  
+Entropy coefficient: 0.01  
+Value coefficient: 0.5  
+Max gradient norm: 0.5  
 
-$$
-L_{\text{PPO}} = -\min\left(
-    r_t(\theta)\hat{A}_t,
-    \text{clip}\big(r_t(\theta), 1-\epsilon_{\text{low}}, 1+\epsilon_{\text{high}}\big)\hat{A}_t
-\right)
-$$
+GAE:
 
-where the probability ratio is:
+A_t = GAE(r_t^train, V(s_t), γ, λ)
 
-$$
-r_t(\theta) = \frac{\pi_\theta(a_t \mid s_t)}{\pi_{\theta_{\text{old}}}(a_t \mid s_t)}
-$$
+PPO objective:
 
-The implementation supports asymmetric clipping:
-```python
-epsilon_low = 0.2
-epsilon_high = 0.2
-```
+L_PPO =
+- min(
+    r_t(θ) * A_t,
+    clip(r_t(θ), 1 - ε_low, 1 + ε_high) * A_t
+)
 
-The same code path can support `clip-higher` variants by increasing `epsilon_high`, but the default methodology uses symmetric clipping unless explicitly changed.
+Probability ratio:
 
-## Grouped Rollouts and Dynamic Sampling
+r_t(θ) =
+π_θ(a_t | s_t)
+/
+π_old(a_t | s_t)
 
-The repaired baseline pipeline supports grouped rollouts. A group is a set of complete episodes collected under the current policy. The default group size is:
+Clipping:
 
-```python
+epsilon_low  = 0.2  
+epsilon_high = 0.2  
+
+---
+
+# Grouped Rollouts and Dynamic Sampling
+
+Episodes are collected in groups.
+
+Default:
+
 group_size = 4
-```
 
-Dynamic sampling uses binary outcomes within each group:
-- All-failure groups are considered uninformative for group-relative updates.
-- All-success groups are considered uninformative for group-relative updates.
-- Mixed-outcome groups are preferred because they contain within-policy contrast.
+Group filtering rule:
 
-The intended filtering rule is:
-```python
-keep_group = 0 < successes_in_group < group_size
-```
+keep_group =
+0 < successes_in_group < group_size
 
-However, early in training mixed groups may be rare. To prevent complete training starvation, the implementation includes a fallback:
-```python
+Fallback mechanism:
+
 dynamic_sampling_fallback_on_empty = True
-```
 
-When no mixed groups are found in an update window, the trainer falls back to the sampled groups for that update and logs the fallback event. This keeps optimization moving while still measuring how often true mixed-outcome sampling is available.
+If no mixed groups are found in an update window, sampled groups are used to avoid training starvation.
 
-The pipeline logs:
-- Fraction of discarded groups
-- Fraction of mixed-outcome groups
-- Mean successes per group
-- Whether fallback was used
-- Policy entropy
-- Gradient norm
+Logged statistics:
 
-## Rollout Temperature
+- discarded group fraction
+- mixed group fraction
+- successes per group
+- fallback usage
+- policy entropy
+- gradient norm
 
-Action sampling can use a rollout temperature:
+---
 
-$$
-\pi_T(a \mid s) = \text{softmax}\left(\frac{z_\theta(s)}{T}\right)
-$$
+# Rollout Temperature
 
-where $T = 1.0$ is the default. Higher temperatures increase exploration by flattening the action distribution during rollout collection.
+Sampling temperature modifies exploration.
 
-The current recommended setting uses:
-```python
+π_T(a | s) =
+softmax(z_θ(s) / T)
+
+Default:
+
 rollout_temperature = 1.0
-```
 
-## AC-GRPO Certainty Variables
+Higher temperature increases exploration.
 
-For each sampled transition:
+---
 
-$$
-\delta_t = \pi_\theta(a_t \mid s_t)
-$$
+# AC-GRPO Certainty Variables
 
-where $a_t$ is the action actually taken.
+Executed-action probability:
 
-The certainty head produces:
+δ_t =
+π_θ(a_t | s_t)
 
-$$
-c_t = \sigma(u_t), \quad u_t = f_\psi(s_t)
-$$
+Certainty:
 
-For discrete `LunarLander` actions, the executed-action probability is bounded by $\delta_t \in [0, 1]$, and under a uniform four-action policy $\delta_t \approx 0.25$. Thus, certainty values collapsing near zero are not expected to be useful for the policy gradient. To prevent certainty from completely shutting off learning, AC policy gating uses an effective gate:
+c_t =
+sigmoid(u_t)
 
-$$
-c_t^{\text{eff}} = c_t(1 - c_{\min}) + c_{\min}
-$$
+Effective certainty gate:
 
-with $c_{\min} = 0.3$.
+c_eff =
+c_t * (1 - c_min) + c_min
 
-The policy advantage is gated by $c_t^{\text{eff}}$, not raw certainty:
+Default:
 
-$$
-\hat{A}^{\text{AC}}_t = \text{stopgrad}(c_t^{\text{eff}}) \hat{A}_t
-$$
+c_min = 0.3
 
-The stop-gradient is critical: the policy loss must not update the certainty network through the gate.
+Gated advantage:
 
-## AC Alignment Loss
+A_t_AC =
+stopgrad(c_eff) * A_t
 
-The alignment loss trains certainty to match the policy's own commitment to the sampled action:
+The stop-gradient prevents the policy from directly updating the certainty network.
 
-$$
-L_{\text{align}}(t) = -\delta_t \log c_t - (1-\delta_t)\log\frac{1-c_t}{K}
-$$
+---
 
-For `LunarLander`, $K = 4$.
+# Alignment Loss
 
-The implementation detaches $\delta_t$ so this loss trains the certainty network rather than pushing policy probabilities through the certainty objective.
+The alignment loss trains certainty to match the policy's commitment to the executed action.
 
-The alignment loss also supports a certainty temperature:
+L_align =
+- δ_t * log(c_t)
+- (1 - δ_t) * log((1 - c_t) / K)
 
-$$
-c_{t,T} = \sigma\left(\frac{\text{logit}(c_t)}{T}\right)
-$$
+For LunarLander:
 
-Then $c_{t,T}$ is used in the alignment objective. The default is:
-```python
-ac_loss_temperature = 1.0
-```
+K = 4
 
-Temperature values $> 1.0$ soften certainty targets; values $< 1.0$ sharpen them.
+The probability δ_t is detached so the loss trains the certainty network only.
 
-## AC Outcome Loss
+---
 
-`AC_FULL` adds an episode-outcome likelihood. For each timestep belonging to a completed episode:
+# Outcome Loss (AC_FULL)
 
-$$
-L_{\text{outcome}}(t) = -\alpha \left[ R_i \log c_t + (1-R_i)\log(1-c_t) \right]
-$$
+AC_FULL adds a trajectory-level likelihood.
 
-with $\alpha = 1.0$.
+L_outcome =
+- α [
+    R_i * log(c_t)
+    +
+    (1 - R_i) * log(1 - c_t)
+]
 
-This couples local certainty to trajectory-level success. The implementation masks incomplete rollout fragments so the outcome loss is applied only to timesteps whose episode outcome is known.
+Default:
 
-## AC Dispersion Proxy for Discrete Actions
+alpha = 1.0
 
-The original AC-GRPO orbit term is motivated by continuous action geometry. `LunarLander` uses discrete actions, so the implementation uses policy entropy as a discrete dispersion surrogate:
+The loss is applied only after episode completion.
 
-$$
-H_t = \mathcal{H}\big(\pi_\theta(\cdot \mid s_t)\big)
-$$
+---
 
-The dispersion proxy is:
+# Dispersion Proxy (Discrete Actions)
 
-$$
-L_{\text{dispersion}}(t) = \frac{1}{2}\exp(u_t)H_t - \frac{1}{2}\beta u_t
-$$
+The dispersion term approximates continuous orbit regularization.
 
-with $\beta = 1.0$.
+Policy entropy:
 
-This is not the exact continuous Gaussian orbit likelihood. It is a discrete-action surrogate that encourages low certainty when the policy distribution is diffuse and higher certainty when the policy is concentrated.
+H_t =
+Entropy(π_θ(. | s_t))
 
-Policy entropy is detached in this loss so the dispersion proxy trains the certainty network without pushing policy logits through the certainty objective.
+Dispersion loss:
 
-## AC Model Variants
+L_dispersion =
+0.5 * exp(u_t) * H_t
+- 0.5 * β * u_t
 
-### AC_LITE
+Default:
 
-`AC_LITE` uses:
-1. PPO policy loss with certainty-gated advantages
-2. Alignment loss for the certainty network
+beta = 1.0
 
-The certainty objective is:
+Policy entropy is detached so the loss trains certainty only.
 
-$$
-L_{\text{cert}}^{\text{AC-LITE}} = L_{\text{align}}
-$$
+---
 
-### AC_FULL
+# Logged Quantities
 
-`AC_FULL` uses:
-1. PPO policy loss with certainty-gated advantages
-2. Alignment loss
-3. Outcome loss
-4. Entropy-based dispersion proxy
+Episode-level logs:
 
-The certainty objective is:
+- global step
+- episode id
+- raw return
+- success label
+- episode length
 
-$$
-L_{\text{cert}}^{\text{AC-FULL}} = L_{\text{align}} + L_{\text{outcome}} + L_{\text{dispersion}}
-$$
+Step-level logs:
 
-The policy and certainty optimizers are separate. Certainty-derived gates are detached in the policy loss, and policy-derived targets are detached in certainty losses where appropriate.
+- timestep
+- policy entropy
+- executed-action probability
+- certainty
 
-## Noise Models
+Update-level logs:
 
-### Observation Noise
+- loss
+- gradient norm
+- entropy
+- kept steps
+- fallback flag
 
-In `OBS_NOISE`, observations are corrupted with Gaussian noise:
+Per-seed summaries include:
 
-$$
-\tilde{s}_t = s_t + \epsilon_t, \quad \epsilon_t \sim \mathcal{N}(0, \sigma^2 I)
-$$
+- method
+- mode
+- seed
+- total steps
+- full configuration
+- pretrained policy path
+- frozen policy flag
+- reward-noise configuration
+- certainty gate parameters
 
-with $\sigma = 0.1$. Both the policy and certainty networks receive the corrupted observation.
+---
 
-### Reward Noise
+# Evaluation Protocol
 
-In `REWARD_NOISE`, the intended corruption is false-negative success supervision. A true successful landing can be converted into a failure signal with probability $p = 0.2$.
+Evaluation always uses:
 
-The key implementation detail is that the corrupted outcome affects the reward used by PPO/GAE, not merely an auxiliary logging label. This makes the noisy-supervision setting fair for comparing methods that are supposed to handle unreliable rewards.
+- greedy policy  
+- no reward noise  
+- no observation noise  
 
-## Reproducibility and Logged Quantities
+Metrics:
 
-Each training run records per-episode and per-step CSV logs.
+- success rate  
+- episode return  
+- best checkpoint performance  
+- seed mean and standard deviation  
 
-**Episode-level logs include:**
-- Global step
-- Episode ID
-- Return
-- Logged success
-- Raw success
-- Episode length
+The final checkpoint is not assumed to be optimal.
 
-**Step-level logs include:**
-- Global step
-- Episode ID
-- Timestep
-- Policy entropy
-- Executed-action probability $\delta_t$
-- Certainty $c_t$
+All saved checkpoints are evaluated.
 
-**Baseline update logs also include:**
-- Discarded group fraction
-- Mixed group fraction
-- Mean successes per group
-- Mean policy entropy
-- Number of kept steps
-- Dynamic-sampling fallback flag
-- Loss
-- Gradient norm
+The best-performing checkpoint is selected using held-out evaluation episodes.
 
-**Per-seed JSON summaries include:**
-- Method
-- Mode
-- Seed
-- Total steps
-- Full training config
-- Runtime metadata
-- Pretrained policy path
-- Whether the pretrained policy was frozen
-- Reward-noise semantics
-- Certainty-gate semantics (for AC runs)
+---
 
-Generated experiment reports summarize seed aggregation and AUROC diagnostics. Reports are saved as `report.md` at the experiment folder root. Plots are saved in the `plots/` subfolder.
+# Design Principle
+
+The experiment isolates a single causal variable:
+
+certainty-gated policy optimization
+
+All methods share:
+
+- identical sparse reward
+- identical optimizer
+- identical architecture
+- identical rollout pipeline
+
+Only the certainty mechanism differs.
+
+This ensures that any observed performance difference can be attributed to certainty-aware optimization rather than reward engineering.
