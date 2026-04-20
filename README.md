@@ -300,16 +300,9 @@ Policy entropy is detached in this loss so the dispersion proxy trains the certa
 1. PPO policy loss with certainty-gated advantages
 2. Alignment loss for the certainty network
 
-The policy loss uses:
-
+The certainty objective is:
 $$
-\hat{A}^{\text{AC}}_t = \text{stopgrad}(c_t^{\text{eff}}) \hat{A}_t
-$$
-
-The certainty loss is:
-
-$$
-L_{\text{AC\_LITE}} = L_{\text{align}}
+\mathcal{L}_{\text{cert}}^{\text{AC-LITE}} = \mathcal{L}_{\text{align}}
 $$
 
 ### AC_FULL
@@ -320,10 +313,9 @@ $$
 3. Outcome loss
 4. Entropy-based dispersion proxy
 
-The certainty loss is:
-
+The certainty objective is:
 $$
-L_{\text{AC\_FULL}} = L_{\text{align}} + L_{\text{outcome}} + L_{\text{dispersion}}
+\mathcal{L}_{\text{cert}}^{\text{AC-FULL}} = \mathcal{L}_{\text{align}} + \mathcal{L}_{\text{outcome}} + \mathcal{L}_{\text{dispersion}}
 $$
 
 The policy and certainty optimizers are separate. Certainty-derived gates are detached in the policy loss, and policy-derived targets are detached in certainty losses where appropriate.
