@@ -31,7 +31,7 @@ BEST_EXPERIMENT_SETTINGS = {
     "rollout_temperature": 1.0,
     "epsilon_low": 0.2,
     "epsilon_high": 0.2,
-    "total_steps": 500_000,
+    "total_steps": 250_000,
     "dynamic_sampling_warmup_steps": 10_000,
 }
 BEST_BASELINE_REPAIR = BEST_EXPERIMENT_SETTINGS

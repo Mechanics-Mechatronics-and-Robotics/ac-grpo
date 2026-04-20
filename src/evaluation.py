@@ -16,7 +16,9 @@ def evaluate_policy_checkpoint(
     config: TrainConfig,
     device: torch.device,
     output_path: Path,
+    checkpoint_label: str | None = None,
 ) -> dict[str, float | str]:
+    checkpoint_name = checkpoint_label or str(checkpoint_path.name)
     policy = PolicyNet(config.obs_size, config.action_size, config.hidden_size).to(device)
     policy.load_state_dict(torch.load(checkpoint_path, map_location=device))
     policy.eval()
@@ -49,7 +51,7 @@ def evaluate_policy_checkpoint(
                 episode_return += float(reward)
                 episode_length += 1
             success = float(bool(info and info.get("is_success", False)) or episode_return >= 200.0)
-            rows.append([str(checkpoint_path.name), eval_seed, episode_idx, episode_return, success, episode_length])
+            rows.append([checkpoint_name, eval_seed, episode_idx, episode_return, success, episode_length])
             returns.append(episode_return)
             successes.append(success)
             lengths.append(episode_length)
@@ -64,7 +66,8 @@ def evaluate_policy_checkpoint(
         writer.writerows(rows)
 
     return {
-        "checkpoint": str(checkpoint_path),
+        "checkpoint": checkpoint_name,
+        "checkpoint_path": str(checkpoint_path),
         "eval_return_mean": sum(returns) / max(1, len(returns)),
         "eval_success_mean": sum(successes) / max(1, len(successes)),
         "eval_length_mean": sum(lengths) / max(1, len(lengths)),

@@ -18,6 +18,12 @@ from src.evaluation import evaluate_policy_checkpoint
 from src.policy_net import PolicyNet
 
 
+SPARSE_REWARD_SEMANTICS = (
+    "Sparse terminal reward for learning: r_t_train=0 before episode end and "
+    "r_T_train=policy_success at termination. Dense LunarLander return is logged only."
+)
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -116,7 +122,8 @@ class PPOBaselineTrainer:
             **summary,
             "config": asdict(self.config),
             "runtime": self._runtime_metadata(),
-            "reward_noise_semantics": "REWARD_NOISE penalizes the terminal rollout reward used by GAE for false-negative successes.",
+            "reward_semantics": SPARSE_REWARD_SEMANTICS,
+            "reward_noise_semantics": "REWARD_NOISE can convert a raw terminal success into policy_success=0; no dense reward is used by PPO/GAE.",
         }
         self.summary_log.write_text(json.dumps(summary_with_config, indent=2), encoding="utf-8")
         self.env.close()
@@ -139,7 +146,7 @@ class PPOBaselineTrainer:
             obs_buf.append(obs)
             actions.append(action.item())
             log_probs.append(log_prob.item())
-            rewards.append(float(reward))
+            rewards.append(0.0)
             dones.append(float(done))
             values.append(value.item())
             entropies.append(entropy.item())
@@ -153,8 +160,7 @@ class PPOBaselineTrainer:
             obs = next_obs
             if done:
                 outcome = self.env.episode_outcome(episode_return, info)
-                if outcome.reward_was_corrupted:
-                    rewards[-1] = rewards[-1] - 200.0
+                rewards[-1] = float(outcome.policy_success)
                 episode_rows.append([global_step, episode_id, episode_return, outcome.logged_success, outcome.raw_success, episode_length])
                 obs, _ = self.env.reset()
                 episode_return = 0.0
@@ -248,7 +254,7 @@ class PPOBaselineTrainer:
                             "obs": obs,
                             "action": int(action.item()),
                             "log_prob": float(log_prob.item()),
-                            "reward": float(reward),
+                            "reward": 0.0,
                             "done": float(done),
                             "value": float(value.item()),
                             "entropy": float(entropy.item()),
@@ -264,8 +270,7 @@ class PPOBaselineTrainer:
                     global_step += 1
                     obs = next_obs
                 outcome = self.env.episode_outcome(episode_return, info)
-                if outcome.reward_was_corrupted:
-                    group_steps[-1]["reward"] = float(group_steps[-1]["reward"]) - 200.0
+                group_steps[-1]["reward"] = float(outcome.policy_success)
                 for idx in range(episode_start, len(group_steps)):
                     group_steps[idx]["episode_success"] = float(outcome.logged_success)
                 group_successes.append(outcome.logged_success)
@@ -462,7 +467,18 @@ class PPOBaselineTrainer:
 
     def _evaluate_checkpoints(self, checkpoints: list[Path]) -> list[dict[str, object]]:
         eval_path = self.log_dir / f"{self.run_id}_checkpoint_eval.csv"
-        return [
-            evaluate_policy_checkpoint(path, self.mode, self.config, self.device, eval_path)
-            for path in checkpoints
-        ]
+        eval_rows: list[dict[str, object]] = []
+        if self.config.pretrained_policy_path:
+            eval_rows.append(
+                evaluate_policy_checkpoint(
+                    Path(self.config.pretrained_policy_path),
+                    self.mode,
+                    self.config,
+                    self.device,
+                    eval_path,
+                    checkpoint_label="checkpoint_0_pretrained",
+                )
+            )
+        for path in checkpoints:
+            eval_rows.append(evaluate_policy_checkpoint(path, self.mode, self.config, self.device, eval_path))
+        return eval_rows

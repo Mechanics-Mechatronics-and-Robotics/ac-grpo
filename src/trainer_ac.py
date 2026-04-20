@@ -17,7 +17,7 @@ from src.env import LunarLanderDiagnosticEnv
 from src.evaluation import evaluate_policy_checkpoint
 from src.losses import alignment_loss, dispersion_proxy_loss, outcome_loss
 from src.policy_net import PolicyNet
-from src.trainer_baseline import set_seed
+from src.trainer_baseline import SPARSE_REWARD_SEMANTICS, set_seed
 
 
 class ACPPOTrainer:
@@ -99,7 +99,8 @@ class ACPPOTrainer:
             **summary,
             "config": asdict(self.config),
             "runtime": self._runtime_metadata(),
-            "reward_noise_semantics": "REWARD_NOISE penalizes the terminal rollout reward used by GAE for false-negative successes.",
+            "reward_semantics": SPARSE_REWARD_SEMANTICS,
+            "reward_noise_semantics": "REWARD_NOISE can convert a raw terminal success into policy_success=0; no dense reward is used by PPO/GAE.",
             "certainty_gate_semantics": "policy advantage gate uses effective_c = c * (1 - c_min) + c_min.",
         }
         self.summary_log.write_text(json.dumps(summary_with_config, indent=2), encoding="utf-8")
@@ -125,7 +126,7 @@ class ACPPOTrainer:
             obs_buf.append(obs)
             actions.append(action.item())
             log_probs.append(log_prob.item())
-            rewards.append(float(reward))
+            rewards.append(0.0)
             dones.append(float(done))
             values.append(value.item())
             entropies.append(entropy.item())
@@ -140,8 +141,7 @@ class ACPPOTrainer:
             obs = next_obs
             if done:
                 outcome = self.env.episode_outcome(episode_return, info)
-                if outcome.reward_was_corrupted:
-                    rewards[-1] = rewards[-1] - 200.0
+                rewards[-1] = float(outcome.policy_success)
                 for idx in range(current_episode_start, len(successes)):
                     successes[idx] = float(outcome.logged_success)
                     outcome_masks[idx] = 1.0
@@ -207,7 +207,7 @@ class ACPPOTrainer:
                             "obs": obs,
                             "action": int(action.item()),
                             "log_prob": float(log_prob.item()),
-                            "reward": float(reward),
+                            "reward": 0.0,
                             "done": float(done),
                             "value": float(value.item()),
                             "entropy": float(entropy.item()),
@@ -223,8 +223,7 @@ class ACPPOTrainer:
                     global_step += 1
                     obs = next_obs
                 outcome = self.env.episode_outcome(episode_return, info)
-                if outcome.reward_was_corrupted:
-                    group_steps[-1]["reward"] = float(group_steps[-1]["reward"]) - 200.0
+                group_steps[-1]["reward"] = float(outcome.policy_success)
                 for idx in range(episode_start, len(group_steps)):
                     group_steps[idx]["success"] = float(outcome.logged_success)
                     group_steps[idx]["outcome_mask"] = 1.0
@@ -312,7 +311,7 @@ class ACPPOTrainer:
                 gated_adv = effective_certainty * advantages[mb]
                 pg_loss = -torch.min(
                     gated_adv * ratio,
-                    gated_adv * torch.clamp(ratio, 1.0 - self.config.clip_coef, 1.0 + self.config.clip_coef),
+                    gated_adv * torch.clamp(ratio, 1.0 - self.config.epsilon_low, 1.0 + self.config.epsilon_high),
                 ).mean()
                 value_loss = nn.functional.mse_loss(self.policy.value(obs_mb), rollout["returns"][mb])
                 policy_loss = pg_loss + self.config.value_coef * value_loss - self.config.entropy_coef * dist.entropy().mean()
@@ -402,7 +401,18 @@ class ACPPOTrainer:
 
     def _evaluate_checkpoints(self, checkpoints: list[Path]) -> list[dict[str, object]]:
         eval_path = self.log_dir / f"{self.run_id}_checkpoint_eval.csv"
-        return [
-            evaluate_policy_checkpoint(path, self.mode, self.config, self.device, eval_path)
-            for path in checkpoints
-        ]
+        eval_rows: list[dict[str, object]] = []
+        if self.config.pretrained_policy_path:
+            eval_rows.append(
+                evaluate_policy_checkpoint(
+                    Path(self.config.pretrained_policy_path),
+                    self.mode,
+                    self.config,
+                    self.device,
+                    eval_path,
+                    checkpoint_label="checkpoint_0_pretrained",
+                )
+            )
+        for path in checkpoints:
+            eval_rows.append(evaluate_policy_checkpoint(path, self.mode, self.config, self.device, eval_path))
+        return eval_rows
