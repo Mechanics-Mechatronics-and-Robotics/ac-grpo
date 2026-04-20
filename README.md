@@ -301,8 +301,9 @@ Policy entropy is detached in this loss so the dispersion proxy trains the certa
 2. Alignment loss for the certainty network
 
 The certainty objective is:
+
 $$
-\mathcal{L}_{\text{cert}}^{\text{AC-LITE}} = \mathcal{L}_{\text{align}}
+L_{\text{cert}}^{\text{AC-LITE}} = L_{\text{align}}
 $$
 
 ### AC_FULL
@@ -314,8 +315,9 @@ $$
 4. Entropy-based dispersion proxy
 
 The certainty objective is:
+
 $$
-\mathcal{L}_{\text{cert}}^{\text{AC-FULL}} = \mathcal{L}_{\text{align}} + \mathcal{L}_{\text{outcome}} + \mathcal{L}_{\text{dispersion}}
+L_{\text{cert}}^{\text{AC-FULL}} = L_{\text{align}} + L_{\text{outcome}} + L_{\text{dispersion}}
 $$
 
 The policy and certainty optimizers are separate. Certainty-derived gates are detached in the policy loss, and policy-derived targets are detached in certainty losses where appropriate.
