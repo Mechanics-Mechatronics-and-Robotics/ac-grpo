@@ -33,6 +33,72 @@ The pipeline supports three environment modes:
 
 For `REWARD_NOISE`, corruption is applied to the reward signal used by PPO/GAE rather than only to auxiliary logging labels. This is critical because the policy must experience the same noisy supervision that the method is designed to handle. In implementation, when a successful episode is flipped to a failure signal, the terminal rollout reward used for advantage estimation is modified before GAE computation.
 
+## Reward and Return Calculation
+
+The pipeline distinguishes between the raw environment reward used for reporting and the training reward used for policy optimization.
+
+At each step, `LunarLander-v2` emits the raw environment reward:
+
+$$
+r_t^{\text{env}}
+$$
+
+The logged episode return is the uncorrupted sum of raw environment rewards:
+
+$$
+G_i^{\text{env}} = \sum_t r_t^{\text{env}}
+$$
+
+This raw return is used for episode-level reporting and for computing the raw success indicator:
+
+$$
+R_i^{\text{raw}} = \mathbb{1}[G_i^{\text{env}} \ge 200]
+$$
+
+or the environment-provided success flag when available.
+
+For `CLEAN` and `OBS_NOISE`, the training reward equals the raw environment reward:
+
+$$
+r_t^{\text{train}} = r_t^{\text{env}}
+$$
+
+For `REWARD_NOISE`, only true successful episodes can be corrupted. With probability $p = 0.2$, a raw success is converted into a false-negative policy target:
+
+$$
+R_i^{\text{policy}} = 0
+\quad \text{even though} \quad
+R_i^{\text{raw}} = 1
+$$
+
+When this happens, the terminal transition reward stored in the rollout buffer is penalized before GAE is computed:
+
+$$
+r_T^{\text{train}} = r_T^{\text{env}} - 200
+$$
+
+All earlier rewards in the episode remain unchanged:
+
+$$
+r_t^{\text{train}} = r_t^{\text{env}}, \quad t < T
+$$
+
+The PPO/AC advantage estimator uses the training reward sequence:
+
+$$
+\hat{A}_t = \text{GAE}(r_t^{\text{train}}, V_\theta(s_t), \gamma, \lambda)
+$$
+
+This means reward noise affects the actual policy gradient rather than only the logged success label. The raw return and raw success are still logged, so downstream analysis can compare true task performance against the noisy supervision seen by the optimizer.
+
+Dynamic sampling and AC outcome labels use the policy/logged outcome:
+
+$$
+R_i^{\text{policy}}
+$$
+
+while final evaluation reports raw greedy environment performance.
+
 ## Methods
 
 The code compares three methods:
