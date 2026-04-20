@@ -301,11 +301,13 @@ Policy entropy is detached in this loss so the dispersion proxy trains the certa
 2. Alignment loss for the certainty network
 
 The policy loss uses:
+
 $$
 \hat{A}^{\text{AC}}_t = \text{stopgrad}(c_t^{\text{eff}}) \hat{A}_t
 $$
 
 The certainty loss is:
+
 $$
 L_{\text{AC\_LITE}} = L_{\text{align}}
 $$
@@ -319,6 +321,7 @@ $$
 4. Entropy-based dispersion proxy
 
 The certainty loss is:
+
 $$
 L_{\text{AC\_FULL}} = L_{\text{align}} + L_{\text{outcome}} + L_{\text{dispersion}}
 $$
