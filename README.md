@@ -62,11 +62,7 @@ r_t^{\text{train}} = 0 \quad \text{for } t < T
 $$
 
 $$
-r_T^{\text{train}} = 
-\begin{cases} 
-1 & \text{if success} \\ 
-0 & \text{if failure} 
-\end{cases}
+r_T^{\text{train}} = \begin{cases} 1 & \text{if success} \\ 0 & \text{if failure} \end{cases}
 $$
 
 The episode return used by the optimizer is therefore:
@@ -183,7 +179,7 @@ Standard PPO with Generalized Advantage Estimation.
 | Steps per update    | 2048               |
 | Batch size          | 64                 |
 | Optimizer           | Adam               |
-| Learning rate       | $1 \times 10^{-4}$ |
+| Learning rate       | $3 \times 10^{-4}$ |
 | Discount $\gamma$   | 0.99               |
 | GAE $\lambda$       | 0.95               |
 | Entropy coefficient | 0.01               |
@@ -199,7 +195,7 @@ $$
 PPO objective:
 
 $$
-L_{\text{PPO}} = -\min\!\left( r_t(\theta)\,\hat{A}_t,\; \text{clip}\!\left(r_t(\theta),\, 1-\epsilon,\, 1+\epsilon\right)\hat{A}_t \right)
+L_{\text{PPO}} = -\min\left( r_t(\theta)\hat{A}_t, \text{clip}\left(r_t(\theta), 1-\epsilon, 1+\epsilon\right)\hat{A}_t \right)
 $$
 
 $$
@@ -231,7 +227,7 @@ If no mixed groups are found in an update window, the full sample is used and th
 ## Rollout Temperature
 
 $$
-\pi_T(a \mid s) = \text{softmax}\!\left(\frac{z_\theta(s)}{T}\right), \qquad T = 1.0
+\pi_T(a \mid s) = \text{softmax}\left(\frac{z_\theta(s)}{T}\right), \qquad T = 1.0
 $$
 
 ---
@@ -255,6 +251,7 @@ $$
 $$
 
 This quantity has the following properties:
+
 - $\delta_t = 0.5$: the policy is indifferent between the executed action and its runner-up. This is the indifference point $c^\dagger = 0.5$.
 - $\delta_t \to 1$: the policy is committed to the executed action.
 - $\delta_t \to 0$: the runner-up dominates; the policy is actively preferring another action.
@@ -265,7 +262,7 @@ This is in contrast to the previous formulation $\delta_t = \pi_\theta(a_t|s_t)$
 ### Certainty
 
 $$
-c_t = \sigma\!\left(f_\psi(s_t)\right) \in (0, 1)
+c_t = \sigma\left(f_\psi(s_t)\right) \in (0, 1)
 $$
 
 The certainty network is trained to predict $\delta_t$ through the mixture MLE derived below. It does **not** receive gradients from the policy objective.
@@ -274,40 +271,38 @@ The certainty network is trained to predict $\delta_t$ through the mixture MLE d
 
 ## Per-Step Mixture MLE
 
-### Generative Model
+### Generative model
 
 At each step, we model the executed action as drawn from a mixture of two distributions: the policy's own distribution (which concentrates on $a_t$) and the runner-up distribution (which concentrates on $\hat{a}_t$), gated by certainty:
 
 $$
-p(a_t \mid s_t,\, c_t) = c_t \cdot \pi_\theta(a_t \mid s_t) + (1 - c_t) \cdot \pi_\theta(\hat{a}_t \mid s_t)
+p(a_t \mid s_t, c_t) = c_t \cdot \pi_\theta(a_t \mid s_t) + (1 - c_t) \cdot \pi_\theta(\hat{a}_t \mid s_t)
 $$
 
 The negative log-likelihood of this model is the **per-step mixture loss**:
 
 $$
-\boxed{\mathcal{L}_t^{\text{mix}} = -\log\!\left[ c_t \cdot \pi_\theta(a_t \mid s_t) + (1-c_t) \cdot \pi_\theta(\hat{a}_t \mid s_t) \right]}
+\boxed{\mathcal{L}_t^{\text{mix}} = -\log\left[ c_t \cdot \pi_\theta(a_t \mid s_t) + (1-c_t) \cdot \pi_\theta(\hat{a}_t \mid s_t) \right]}
 $$
 
-### Gradient on the Certainty Network
+### Gradient on the certainty network
 
 When $\pi_\theta$ is treated as fixed (stop-gradient), the gradient on $c_t$ is:
 
 $$
-\frac{\partial \mathcal{L}_t^{\text{mix}}}{\partial c_t}
-= -\frac{\pi_\theta(a_t \mid s_t) - \pi_\theta(\hat{a}_t \mid s_t)}{c_t\,\pi_\theta(a_t \mid s_t) + (1-c_t)\,\pi_\theta(\hat{a}_t \mid s_t)}
+\frac{\partial \mathcal{L}_t^{\text{mix}}}{\partial c_t} = -\frac{\pi_\theta(a_t \mid s_t) - \pi_\theta(\hat{a}_t \mid s_t)}{c_t\,\pi_\theta(a_t \mid s_t) + (1-c_t)\,\pi_\theta(\hat{a}_t \mid s_t)}
 $$
 
 - When $\pi_\theta(a_t) > \pi_\theta(\hat{a}_t)$: gradient is negative → $c_t$ increases → certainty rises. ✓
 - When $\pi_\theta(a_t) < \pi_\theta(\hat{a}_t)$: gradient is positive → $c_t$ decreases → certainty falls. ✓
 - When $\pi_\theta(a_t) = \pi_\theta(\hat{a}_t)$: gradient is zero — exact indifference, $c^\dagger = 0.5$. ✓
 
-### Gradient on the Policy Network
+### Gradient on the policy network
 
 When $c_t$ is treated as fixed (stop-gradient), the gradient on $\theta$ is:
 
 $$
-\frac{\partial \mathcal{L}_t^{\text{mix}}}{\partial \theta}
-= -\frac{c_t \cdot \nabla_\theta \pi_\theta(a_t \mid s_t) + (1-c_t) \cdot \nabla_\theta \pi_\theta(\hat{a}_t \mid s_t)}{c_t\,\pi_\theta(a_t \mid s_t) + (1-c_t)\,\pi_\theta(\hat{a}_t \mid s_t)}
+\frac{\partial \mathcal{L}_t^{\text{mix}}}{\partial \theta} = -\frac{c_t \cdot \nabla_\theta \pi_\theta(a_t \mid s_t) + (1-c_t) \cdot \nabla_\theta \pi_\theta(\hat{a}_t \mid s_t)}{c_t\,\pi_\theta(a_t \mid s_t) + (1-c_t)\,\pi_\theta(\hat{a}_t \mid s_t)}
 $$
 
 This is proportional to the standard policy gradient at initialization ($c_t \approx 0.5$, $\pi_\theta(a_t) \approx \pi_\theta(\hat{a}_t)$), ensuring that training begins immediately without a cold-start phase.
@@ -329,7 +324,7 @@ $$
 The PPO objective then becomes:
 
 $$
-L_{\text{PPO}}^{\text{AC}} = -\min\!\left( r_t^{\text{AC}}(\theta)\,\hat{A}_t,\; \text{clip}\!\left(r_t^{\text{AC}}(\theta),\, 1-\epsilon,\, 1+\epsilon\right)\hat{A}_t \right)
+L_{\text{PPO}}^{\text{AC}} = -\min\left( r_t^{\text{AC}}(\theta)\hat{A}_t, \text{clip}\left(r_t^{\text{AC}}(\theta), 1-\epsilon, 1+\epsilon\right)\hat{A}_t \right)
 $$
 
 The stop-gradient on $c_t$ prevents the policy loss from updating the certainty network. The advantage $\hat{A}_t$ is computed identically to the baseline via GAE on the sparse binary reward.
@@ -389,7 +384,7 @@ $$
 **Certainty objective:**
 
 $$
-\mathcal{L}_{\text{cert}}^{\text{AC-LITE}} = -\frac{1}{T} \sum_{t=1}^T \log \left[ c_t \cdot \pi_\theta^{\text{stop}}(a_t \mid s_t) + (1 - c_t) \cdot \pi_\theta^{\text{stop}}(\hat{a}_t \mid s_t) \right]
+\mathcal{L}_{\text{cert}}^{\text{AC-LITE}} = -\frac{1}{T}\sum_{t=1}^T \log\left[c_t \cdot \pi_\theta^{\text{stop}}(a_t \mid s_t) + (1-c_t) \cdot \pi_\theta^{\text{stop}}(\hat{a}_t \mid s_t)\right]
 $$
 
 `AC_LITE` asks a single question per step: *does the policy beat its own runner-up?* The certainty network learns to answer that question from observations alone, without access to any reward signal. This is the minimal viable AC mechanism.
@@ -410,7 +405,7 @@ $$
 **Certainty objective (joint MLE over two independent data sources):**
 
 $$
-\mathcal{L}_{\text{cert}}^{\text{AC-FULL}} = -\frac{1}{T} \sum_{t=1}^T \log \left[ c_t \cdot \pi_\theta^{\text{stop}}(a_t \mid s_t) + (1 - c_t) \cdot \pi_\theta^{\text{stop}}(\hat{a}_t \mid s_t) \right] - R_i \log \bar{c}_i - (1 - R_i) \log(1 - \bar{c}_i)
+\mathcal{L}_{\text{cert}}^{\text{AC-FULL}} = -\frac{1}{T}\sum_{t=1}^T \log\left[c_t \cdot \pi_\theta^{\text{stop}}(a_t \mid s_t) + (1-c_t) \cdot \pi_\theta^{\text{stop}}(\hat{a}_t \mid s_t)\right] - R_i \log \bar{c}_i - (1-R_i)\log(1-\bar{c}_i)
 $$
 
 `AC_FULL` adds the episode outcome as a second independent observation for certainty. Under reward noise, the two terms provide conflicting evidence for corrupted trajectories, which produces an intermediate certainty value and attenuates the policy gradient on those trajectories.
