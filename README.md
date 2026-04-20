@@ -381,16 +381,15 @@ The certainty is pushed upward for successful trajectories. For a failed episode
 2. Per-step mixture MLE for the certainty network.
 
 **Policy objective:**
+
 $$
 L_{\text{policy}}^{\text{AC-LITE}} = L_{\text{PPO}}^{\text{AC}}
 $$
 
 **Certainty objective:**
+
 $$
-\mathcal{L}_{\text{cert}}^{\text{AC-LITE}}
-= -\frac{1}{T}\sum_{t=1}^T
-\log\!\left[c_t \cdot \pi_\theta^{\text{stop}}(a_t \mid s_t)
-+ (1-c_t) \cdot \pi_\theta^{\text{stop}}(\hat{a}_t \mid s_t)\right]
+\mathcal{L}_{\text{cert}}^{\text{AC-LITE}} = -\frac{1}{T} \sum_{t=1}^T \log \left[ c_t \cdot \pi_\theta^{\text{stop}}(a_t \mid s_t) + (1 - c_t) \cdot \pi_\theta^{\text{stop}}(\hat{a}_t \mid s_t) \right]
 $$
 
 `AC_LITE` asks a single question per step: *does the policy beat its own runner-up?* The certainty network learns to answer that question from observations alone, without access to any reward signal. This is the minimal viable AC mechanism.
@@ -403,17 +402,15 @@ $$
 3. Trajectory-level outcome MLE for the certainty network.
 
 **Policy objective:**
+
 $$
 L_{\text{policy}}^{\text{AC-FULL}} = L_{\text{PPO}}^{\text{AC}}
 $$
 
 **Certainty objective (joint MLE over two independent data sources):**
+
 $$
-\mathcal{L}_{\text{cert}}^{\text{AC-FULL}}
-= -\frac{1}{T}\sum_{t=1}^T
-\log\!\left[c_t \cdot \pi_\theta^{\text{stop}}(a_t \mid s_t)
-+ (1-c_t) \cdot \pi_\theta^{\text{stop}}(\hat{a}_t \mid s_t)\right]
-- R_i \log \bar{c}_i - (1-R_i)\log(1-\bar{c}_i)
+\mathcal{L}_{\text{cert}}^{\text{AC-FULL}} = -\frac{1}{T} \sum_{t=1}^T \log \left[ c_t \cdot \pi_\theta^{\text{stop}}(a_t \mid s_t) + (1 - c_t) \cdot \pi_\theta^{\text{stop}}(\hat{a}_t \mid s_t) \right] - R_i \log \bar{c}_i - (1 - R_i) \log(1 - \bar{c}_i)
 $$
 
 `AC_FULL` adds the episode outcome as a second independent observation for certainty. Under reward noise, the two terms provide conflicting evidence for corrupted trajectories, which produces an intermediate certainty value and attenuates the policy gradient on those trajectories.
