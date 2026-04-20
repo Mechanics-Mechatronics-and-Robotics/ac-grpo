@@ -1,6 +1,3 @@
-Here is the complete, polished `README.md` in a single block. All equations are strictly isolated with blank lines (required for GitHub's math renderer), notation is standardized, markdown tables/lists are aligned, and minor technical phrasing (e.g., the $q_t$ log description) has been corrected for precision.
-
-````markdown
 # AC-GRPO Methodology (Sparse Reward)
 
 This repository implements a `LunarLander-v2` diagnostic for **Alignment-Certainty Group Relative Policy Optimization (AC-GRPO)** under a **sparse terminal reward** regime.
@@ -495,4 +492,3 @@ All methods share:
 - Identical pretrained anchor
 
 Only the certainty mechanism differs. The AC objectives introduce no free hyperparameters beyond the learning rate: the per-step and trajectory-level terms are log-likelihoods from independent observations of the same latent certainty variable, and their combination follows from the joint MLE without a mixing coefficient.
-````
