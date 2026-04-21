@@ -9,18 +9,34 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from src.certainty_net import CertaintyNet
 from src.config import CHECKPOINT_DIR, LOG_DIR, TrainConfig, ensure_output_dirs
 from src.env import LunarLanderDiagnosticEnv
 from src.evaluation import evaluate_policy_checkpoint
-from src.losses import mixture_mle_loss, mixture_probability, runner_up_margin, runner_up_stats, trajectory_outcome_mle_loss
+from src.losses import mixture_nll, outcome_nll, runner_up_stats
 from src.policy_net import PolicyNet
 from src.trainer_baseline import SPARSE_REWARD_SEMANTICS, set_seed
 
 
 class ACPPOTrainer:
+    @staticmethod
+    def _runner_up_margin(action_probs: torch.Tensor, runner_up_probs: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        denom = (action_probs + runner_up_probs).clamp_min(eps)
+        return ((action_probs + 0.5 * eps) / (denom + eps)).clamp(eps, 1.0 - eps)
+
+    @staticmethod
+    def _mixture_probability(
+        certainty: torch.Tensor,
+        action_probs: torch.Tensor,
+        runner_up_probs: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        c = certainty.clamp(eps, 1.0 - eps)
+        return (c * action_probs + (1.0 - c) * runner_up_probs).clamp_min(eps)
+
     def __init__(
         self,
         method: str,
@@ -43,7 +59,7 @@ class ACPPOTrainer:
         self.env = LunarLanderDiagnosticEnv(mode, seed, self.config.env_id, self.config.reward_noise_p, self.config.obs_noise_sigma)
         self.policy = PolicyNet(self.config.obs_size, self.config.action_size, self.config.hidden_size).to(self.device)
         self._load_pretrained_policy()
-        self.certainty = CertaintyNet(self.config.obs_size, self.config.hidden_size, self.config.initial_certainty).to(self.device)
+        self.certainty = CertaintyNet(self.config.obs_size, self.config.hidden_size).to(self.device)
         self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.config.policy_lr)
         self.certainty_optimizer = torch.optim.Adam(self.certainty.parameters(), lr=self.config.certainty_lr)
         self.run_id = f"{run_name or method}_{mode}_seed{seed}"
@@ -103,7 +119,7 @@ class ACPPOTrainer:
             "runtime": self._runtime_metadata(),
             "reward_semantics": SPARSE_REWARD_SEMANTICS,
             "reward_noise_semantics": "REWARD_NOISE can convert a raw terminal success into policy_success=0; no dense reward is used by PPO/GAE.",
-            "certainty_gate_semantics": "AC v3 uses a runner-up mixture PPO ratio with stop-gradient certainty; certainty is initialized near PPO when a pretrained anchor is used, then trained by mixture MLE plus trajectory outcome MLE for AC_FULL.",
+            "certainty_gate_semantics": "AC v3 uses a runner-up mixture PPO ratio with stop-gradient certainty; certainty is learned by its own network from random initialization via mixture NLL, plus trajectory outcome NLL for AC_FULL.",
             "unmixed_group_semantics": "If a grouped update contains no mixed-outcome groups, the sampled batch is retained for logging/critic/certainty updates, but actor updates are skipped by default because all-success/all-fail groups have no contrast.",
         }
         self.summary_log.write_text(json.dumps(summary_with_config, indent=2), encoding="utf-8")
@@ -126,9 +142,9 @@ class ACPPOTrainer:
                 action, log_prob, entropy, _, value = self.policy.act(obs_t)
                 probs = self.policy.distribution(obs_t).probs
                 action_prob, runner_prob, runner_action = runner_up_stats(probs, action)
-                delta = runner_up_margin(action_prob, runner_prob)
+                delta = self._runner_up_margin(action_prob, runner_prob)
                 certainty, _ = self.certainty(obs_t)
-                old_mixture_prob = mixture_probability(certainty, action_prob, runner_prob)
+                old_mixture_prob = self._mixture_probability(certainty, action_prob, runner_prob)
             next_obs, reward, terminated, truncated, info = self.env.step(int(action.item()))
             done = terminated or truncated
             obs_buf.append(obs)
@@ -222,9 +238,9 @@ class ACPPOTrainer:
                         action, log_prob, entropy, _, value = self.policy.act(obs_t, temperature=cfg.rollout_temperature)
                         probs = self.policy.distribution(obs_t, temperature=cfg.rollout_temperature).probs
                         action_prob, runner_prob, runner_action = runner_up_stats(probs, action)
-                        delta = runner_up_margin(action_prob, runner_prob)
+                        delta = self._runner_up_margin(action_prob, runner_prob)
                         certainty, _ = self.certainty(obs_t)
-                        old_mixture_prob = mixture_probability(certainty, action_prob, runner_prob)
+                        old_mixture_prob = self._mixture_probability(certainty, action_prob, runner_prob)
                     next_obs, reward, terminated, truncated, info = self.env.step(int(action.item()))
                     done = terminated or truncated
                     group_steps.append(
@@ -352,62 +368,34 @@ class ACPPOTrainer:
         last_trajectory_loss = math.nan
         last_certainty_grad_norm = math.nan
         last_mean_trajectory_certainty = math.nan
+        ratio_means: list[float] = []
+        ratio_maxes: list[float] = []
         skip_actor_update = (
             self.config.skip_policy_update_on_unmixed_fallback
             and float(rollout.get("group_total", torch.tensor(0.0, device=self.device)).item()) > 0.0
             and float(rollout.get("group_mixed", torch.tensor(0.0, device=self.device)).item()) == 0.0
         )
         for _ in range(self.config.update_epochs):
-            certainty, _ = self.certainty(rollout["obs"])
-            with torch.no_grad():
-                dist = self.policy.distribution(rollout["obs"])
-                probs = dist.probs
-                action_probs, runner_up_probs, _ = runner_up_stats(probs, rollout["actions"])
-            mixture_loss = mixture_mle_loss(certainty, action_probs, runner_up_probs)
-            trajectory_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-            mean_trajectory_certainty = math.nan
-            if self.method == "AC_FULL":
-                trajectory_loss = trajectory_outcome_mle_loss(
-                    certainty,
-                    rollout["episode_ids"],
-                    rollout["success"],
-                    rollout["terminal_mask"],
-                )
-                completed_means = [
-                    certainty[rollout["episode_ids"] == episode_id].mean()
-                    for episode_id in torch.unique(rollout["episode_ids"].detach())
-                    if bool(((rollout["episode_ids"] == episode_id) & rollout["terminal_mask"].bool()).any().item())
-                ]
-                if completed_means:
-                    mean_trajectory_certainty = float(torch.stack(completed_means).mean().item())
-            certainty_loss = mixture_loss + trajectory_loss
-            if not torch.isfinite(certainty_loss):
-                raise FloatingPointError("NaN loss detected")
-            self.certainty_optimizer.zero_grad()
-            certainty_loss.backward()
-            certainty_grad_norm = nn.utils.clip_grad_norm_(self.certainty.parameters(), self.config.max_grad_norm)
-            self.certainty_optimizer.step()
-            last_certainty_loss = float(certainty_loss.item())
-            last_mixture_loss = float(mixture_loss.item())
-            last_trajectory_loss = float(trajectory_loss.item())
-            last_certainty_grad_norm = float(certainty_grad_norm.item() if hasattr(certainty_grad_norm, "item") else certainty_grad_norm)
-            last_mean_trajectory_certainty = mean_trajectory_certainty
-
             perm = idxs[torch.randperm(n, device=self.device)]
             for start in range(0, n, self.config.batch_size):
                 mb = perm[start : start + self.config.batch_size]
                 obs_mb = rollout["obs"][mb]
                 actions_mb = rollout["actions"][mb]
                 runner_up_actions_mb = rollout["runner_up_actions"][mb]
-                with torch.no_grad():
-                    certainty_mb, _ = self.certainty(obs_mb)
+                self.policy_optimizer.zero_grad()
+                self.certainty_optimizer.zero_grad()
                 dist = self.policy.distribution(obs_mb)
-                probs = dist.probs
+                probs = F.softmax(dist.logits, dim=1)
+                certainty_mb, _ = self.certainty(obs_mb)
                 action_probs = probs.gather(1, actions_mb.view(-1, 1)).squeeze(1)
                 runner_up_probs = probs.gather(1, runner_up_actions_mb.view(-1, 1)).squeeze(1)
-                q = mixture_probability(certainty_mb, action_probs, runner_up_probs)
+                q = self._mixture_probability(certainty_mb, action_probs, runner_up_probs)
                 old_q = rollout["old_mixture_probs"][mb]
                 ratio = q / old_q.clamp_min(1e-8)
+                mixture_ratio_mean = ratio.mean().item()
+                mixture_ratio_max = ratio.abs().max().item()
+                ratio_means.append(float(mixture_ratio_mean))
+                ratio_maxes.append(float(mixture_ratio_max))
                 pg_loss = -torch.min(
                     advantages[mb] * ratio,
                     advantages[mb] * torch.clamp(ratio, 1.0 - self.config.epsilon_low, 1.0 + self.config.epsilon_high),
@@ -420,12 +408,46 @@ class ACPPOTrainer:
                 if not torch.isfinite(policy_loss):
                     raise FloatingPointError("NaN loss detected")
                 if not self.config.freeze_pretrained_policy:
-                    self.policy_optimizer.zero_grad()
-                    policy_loss.backward()
+                    policy_loss.backward(retain_graph=True)
                     policy_grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
                     self.policy_optimizer.step()
                     last_policy_grad_norm = float(policy_grad_norm.item() if hasattr(policy_grad_norm, "item") else policy_grad_norm)
                 last_policy_loss = float(policy_loss.item())
+            self.policy_optimizer.zero_grad()
+            self.certainty_optimizer.zero_grad()
+            dist_cert = self.policy.distribution(rollout["obs"])
+            probs_cert = F.softmax(dist_cert.logits, dim=1)
+            certainty_cert, _ = self.certainty(rollout["obs"])
+            action_probs_cert, runner_up_probs_cert, _ = runner_up_stats(probs_cert, rollout["actions"])
+            mixture_loss = mixture_nll(certainty_cert, action_probs_cert, runner_up_probs_cert)
+            trajectory_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+            mean_trajectory_certainty = math.nan
+            if self.method == "AC_FULL":
+                trajectory_loss = outcome_nll(
+                    certainty_cert,
+                    rollout["episode_ids"],
+                    rollout["success"],
+                    rollout["terminal_mask"],
+                )
+                completed_means = [
+                    certainty_cert[rollout["episode_ids"] == episode_id].mean()
+                    for episode_id in torch.unique(rollout["episode_ids"])
+                    if bool(((rollout["episode_ids"] == episode_id) & rollout["terminal_mask"].bool()).any().item())
+                ]
+                if completed_means:
+                    last_mean_trajectory_certainty = float(torch.stack(completed_means).mean().item())
+            certainty_loss = mixture_loss + trajectory_loss
+            if not torch.isfinite(certainty_loss):
+                raise FloatingPointError("NaN loss detected")
+            certainty_loss.backward()
+            certainty_grad_norm = nn.utils.clip_grad_norm_(self.certainty.parameters(), self.config.max_grad_norm)
+            self.certainty_optimizer.step()
+            last_certainty_loss = float(certainty_loss.item())
+            last_mixture_loss = float(mixture_loss.item())
+            last_trajectory_loss = float(trajectory_loss.item())
+            last_certainty_grad_norm = float(certainty_grad_norm.item() if hasattr(certainty_grad_norm, "item") else certainty_grad_norm)
+            if self.method != "AC_FULL":
+                last_mean_trajectory_certainty = math.nan
         return {
             "policy_loss": last_policy_loss,
             "certainty_loss": last_certainty_loss,
@@ -435,6 +457,8 @@ class ACPPOTrainer:
             "certainty_grad_norm": last_certainty_grad_norm,
             "mean_trajectory_certainty": last_mean_trajectory_certainty,
             "policy_update_skipped": float(skip_actor_update),
+            "mixture_ratio_mean": (sum(ratio_means) / len(ratio_means)) if ratio_means else math.nan,
+            "mixture_ratio_max": max(ratio_maxes) if ratio_maxes else math.nan,
         }
 
     def _init_logs(self) -> None:
@@ -462,6 +486,8 @@ class ACPPOTrainer:
                     "mean_certainty",
                     "mean_trajectory_certainty",
                     "policy_update_skipped",
+                    "mixture_ratio_mean",
+                    "mixture_ratio_max",
                 ]
             )
 
@@ -488,6 +514,8 @@ class ACPPOTrainer:
             float(rollout["certainty"].mean().item()) if rollout["certainty"].numel() else math.nan,
             update_stats.get("mean_trajectory_certainty", math.nan),
             update_stats.get("policy_update_skipped", 0.0),
+            update_stats.get("mixture_ratio_mean", math.nan),
+            update_stats.get("mixture_ratio_max", math.nan),
         ]
         self._append_rows(self.update_log, [row])
 

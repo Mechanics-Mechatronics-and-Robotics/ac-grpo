@@ -74,7 +74,6 @@ class TrainConfig:
     obs_size: int = 8
     action_size: int = 4
     hidden_size: int = 128
-    initial_certainty: float = 0.9
     pretrained_policy_path: str | None = str(DEFAULT_PRETRAINED_POLICY)
     load_pretrained_critic: bool = False
     freeze_pretrained_policy: bool = False

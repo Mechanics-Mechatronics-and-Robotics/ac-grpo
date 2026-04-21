@@ -5,6 +5,7 @@ import csv
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrained-policy-path", default=str(DEFAULT_PRETRAINED_POLICY))
     parser.add_argument("--freeze-pretrained-policy", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="Run seed 42 only.")
+    parser.add_argument("--max-parallel-seeds", type=int, default=None, help="Run up to this many seeds concurrently. Defaults to all selected seeds.")
     return parser.parse_args()
 
 
@@ -46,6 +48,120 @@ def write_yaml(path: Path, data: dict[str, object]) -> None:
 def run_command(command: list[str], cwd: Path) -> None:
     print("running:", " ".join(command), flush=True)
     subprocess.run(command, cwd=cwd, check=True)
+
+
+def build_seed_command(
+    method: str,
+    settings: dict[str, object],
+    seed: int,
+    run_dir: Path,
+    pretrained_policy_path: str | None,
+    freeze_pretrained_policy: bool,
+    config_defaults: TrainConfig,
+) -> list[str]:
+    if method == "BASELINE":
+        command = [
+            sys.executable,
+            "scripts/train_baseline.py",
+            "--mode",
+            str(settings["mode"]),
+            "--seed",
+            str(seed),
+            "--total-steps",
+            str(settings["total_steps"]),
+            "--group-size",
+            str(settings.get("group_size", 4)),
+            "--rollout-temperature",
+            str(settings["rollout_temperature"]),
+            "--epsilon-low",
+            str(settings["epsilon_low"]),
+            "--epsilon-high",
+            str(settings["epsilon_high"]),
+            "--dynamic-sampling-warmup-steps",
+            str(settings.get("dynamic_sampling_warmup_steps", 0)),
+            "--output-dir",
+            str(run_dir),
+            "--run-name",
+            "BASELINE",
+        ]
+        if pretrained_policy_path:
+            command.extend(["--pretrained-policy-path", pretrained_policy_path])
+        if freeze_pretrained_policy:
+            command.append("--freeze-pretrained-policy")
+        if settings["grouped_rollouts"]:
+            command.append("--grouped-rollouts")
+        if settings["dynamic_sampling"]:
+            command.append("--dynamic-sampling")
+        return command
+    command = [
+        sys.executable,
+        "scripts/train_ac.py",
+        "--method",
+        method,
+        "--mode",
+        str(settings["mode"]),
+        "--seed",
+        str(seed),
+        "--total-steps",
+        str(settings["total_steps"]),
+        "--policy-lr",
+        str(settings.get("policy_lr", config_defaults.policy_lr)),
+        "--certainty-lr",
+        str(settings.get("certainty_lr", config_defaults.certainty_lr)),
+        "--group-size",
+        str(settings.get("group_size", 4)),
+        "--rollout-temperature",
+        str(settings["rollout_temperature"]),
+        "--epsilon-low",
+        str(settings["epsilon_low"]),
+        "--epsilon-high",
+        str(settings["epsilon_high"]),
+        "--dynamic-sampling-warmup-steps",
+        str(settings.get("dynamic_sampling_warmup_steps", 0)),
+        "--output-dir",
+        str(run_dir),
+        "--run-name",
+        method,
+    ]
+    if settings["grouped_rollouts"]:
+        command.append("--grouped-rollouts")
+    if settings["dynamic_sampling"]:
+        command.append("--dynamic-sampling")
+    if pretrained_policy_path:
+        command.extend(["--pretrained-policy-path", pretrained_policy_path])
+    if freeze_pretrained_policy:
+        command.append("--freeze-pretrained-policy")
+    return command
+
+
+def run_seed_commands(commands: list[list[str]], cwd: Path, max_parallel: int) -> None:
+    pending = list(commands)
+    running: dict[subprocess.Popen[str], list[str]] = {}
+    while pending or running:
+        while pending and len(running) < max_parallel:
+            command = pending.pop(0)
+            print("running:", " ".join(command), flush=True)
+            proc = subprocess.Popen(command, cwd=cwd)
+            running[proc] = command
+        if not running:
+            continue
+        finished = []
+        for proc, command in list(running.items()):
+            code = proc.poll()
+            if code is None:
+                continue
+            finished.append((proc, command, code))
+        if not finished:
+            time.sleep(0.2)
+            continue
+        for proc, command, code in finished:
+            running.pop(proc, None)
+            if code != 0:
+                for other in list(running):
+                    other.terminate()
+                for other in list(running):
+                    other.wait()
+                raise subprocess.CalledProcessError(code, command)
 
 
 def summarize_seed(seed_dir: Path, seed: int) -> dict[str, float | int]:
@@ -115,6 +231,7 @@ def run_one_experiment(
     analyze_single: bool,
     pretrained_policy_path: str | None,
     freeze_pretrained_policy: bool,
+    max_parallel_seeds: int,
 ) -> Path:
     experiments = {**BASELINE_EXPERIMENTS, **METHOD_MODE_EXPERIMENTS}
     settings = dict(experiments[experiment_name])
@@ -133,80 +250,19 @@ def run_one_experiment(
         **settings,
     }
     write_yaml(run_dir / "config.yaml", config_payload)
-    for seed in seeds:
-        if method == "BASELINE":
-            command = [
-                sys.executable,
-                "scripts/train_baseline.py",
-                "--mode",
-                str(settings["mode"]),
-                "--seed",
-                str(seed),
-                "--total-steps",
-                str(settings["total_steps"]),
-                "--group-size",
-                str(settings.get("group_size", 4)),
-                "--rollout-temperature",
-                str(settings["rollout_temperature"]),
-                "--epsilon-low",
-                str(settings["epsilon_low"]),
-                "--epsilon-high",
-                str(settings["epsilon_high"]),
-                "--dynamic-sampling-warmup-steps",
-                str(settings.get("dynamic_sampling_warmup_steps", 0)),
-                "--output-dir",
-                str(run_dir),
-                "--run-name",
-                "BASELINE",
-            ]
-            if pretrained_policy_path:
-                command.extend(["--pretrained-policy-path", pretrained_policy_path])
-            if freeze_pretrained_policy:
-                command.append("--freeze-pretrained-policy")
-            if settings["grouped_rollouts"]:
-                command.append("--grouped-rollouts")
-            if settings["dynamic_sampling"]:
-                command.append("--dynamic-sampling")
-        else:
-            command = [
-                sys.executable,
-                "scripts/train_ac.py",
-                "--method",
-                method,
-                "--mode",
-                str(settings["mode"]),
-                "--seed",
-                str(seed),
-                "--total-steps",
-                str(settings["total_steps"]),
-                "--policy-lr",
-                str(settings.get("policy_lr", config_defaults.policy_lr)),
-                "--certainty-lr",
-                str(settings.get("certainty_lr", config_defaults.certainty_lr)),
-                "--group-size",
-                str(settings.get("group_size", 4)),
-                "--rollout-temperature",
-                str(settings["rollout_temperature"]),
-                "--epsilon-low",
-                str(settings["epsilon_low"]),
-                "--epsilon-high",
-                str(settings["epsilon_high"]),
-                "--dynamic-sampling-warmup-steps",
-                str(settings.get("dynamic_sampling_warmup_steps", 0)),
-                "--output-dir",
-                str(run_dir),
-                "--run-name",
-                method,
-            ]
-            if settings["grouped_rollouts"]:
-                command.append("--grouped-rollouts")
-            if settings["dynamic_sampling"]:
-                command.append("--dynamic-sampling")
-            if pretrained_policy_path:
-                command.extend(["--pretrained-policy-path", pretrained_policy_path])
-            if freeze_pretrained_policy:
-                command.append("--freeze-pretrained-policy")
-        run_command(command, repo)
+    commands = [
+        build_seed_command(
+            method,
+            settings,
+            seed,
+            run_dir,
+            pretrained_policy_path,
+            freeze_pretrained_policy,
+            config_defaults,
+        )
+        for seed in seeds
+    ]
+    run_seed_commands(commands, repo, max_parallel=max_parallel_seeds)
     aggregate_rows = write_aggregate(run_dir, seeds)
     summary = {"experiment": experiment_name, "run_dir": str(run_dir), "seeds": list(seeds), "settings": settings, "aggregate": aggregate_rows}
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -220,6 +276,7 @@ def main() -> None:
     repo = Path(__file__).resolve().parents[1]
     names = selected_experiments(args)
     seeds = (42,) if args.smoke else SEEDS
+    max_parallel_seeds = max(1, min(args.max_parallel_seeds or len(seeds), len(seeds)))
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     label = "all_experiments" if args.all else names[0]
     parent_dir = OUTPUTS_DIR / f"{stamp}_{label}"
@@ -241,6 +298,7 @@ def main() -> None:
             analyze_single=True,
             pretrained_policy_path=args.pretrained_policy_path,
             freeze_pretrained_policy=args.freeze_pretrained_policy,
+            max_parallel_seeds=max_parallel_seeds,
         )
         for name in names
     ]
