@@ -59,9 +59,10 @@ class TrainConfig:
     batch_size: int = 64
     total_steps: int = 60_000
     learning_rate: float = 1e-4
+    policy_lr: float = 1e-4
+    certainty_lr: float = 1e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_coef: float = 0.2
     epsilon_low: float = 0.2
     epsilon_high: float = 0.2
     update_epochs: int = 4
@@ -73,11 +74,9 @@ class TrainConfig:
     obs_size: int = 8
     action_size: int = 4
     hidden_size: int = 128
-    alpha: float = 1.0
-    beta: float = 1.0
-    ac_loss_temperature: float = 1.0
-    certainty_min_gate: float = 0.3
+    initial_certainty: float = 0.9
     pretrained_policy_path: str | None = str(DEFAULT_PRETRAINED_POLICY)
+    load_pretrained_critic: bool = False
     freeze_pretrained_policy: bool = False
     checkpoint_interval: int = 10_000
     eval_seeds: tuple[int, ...] = (101, 102, 103)
@@ -89,6 +88,7 @@ class TrainConfig:
     max_group_attempts_per_update: int = 256
     dynamic_sampling_warmup_steps: int = 150_000
     dynamic_sampling_fallback_on_empty: bool = True
+    skip_policy_update_on_unmixed_fallback: bool = True
 
 
 def ensure_output_dirs() -> None:

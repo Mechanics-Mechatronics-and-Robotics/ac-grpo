@@ -15,7 +15,7 @@ from src.certainty_net import CertaintyNet
 from src.config import CHECKPOINT_DIR, LOG_DIR, TrainConfig, ensure_output_dirs
 from src.env import LunarLanderDiagnosticEnv
 from src.evaluation import evaluate_policy_checkpoint
-from src.losses import alignment_loss, dispersion_proxy_loss, outcome_loss
+from src.losses import mixture_mle_loss, mixture_probability, runner_up_margin, runner_up_stats, trajectory_outcome_mle_loss
 from src.policy_net import PolicyNet
 from src.trainer_baseline import SPARSE_REWARD_SEMANTICS, set_seed
 
@@ -43,9 +43,9 @@ class ACPPOTrainer:
         self.env = LunarLanderDiagnosticEnv(mode, seed, self.config.env_id, self.config.reward_noise_p, self.config.obs_noise_sigma)
         self.policy = PolicyNet(self.config.obs_size, self.config.action_size, self.config.hidden_size).to(self.device)
         self._load_pretrained_policy()
-        self.certainty = CertaintyNet(self.config.obs_size, self.config.hidden_size).to(self.device)
-        self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.config.learning_rate)
-        self.certainty_optimizer = torch.optim.Adam(self.certainty.parameters(), lr=self.config.learning_rate)
+        self.certainty = CertaintyNet(self.config.obs_size, self.config.hidden_size, self.config.initial_certainty).to(self.device)
+        self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.config.policy_lr)
+        self.certainty_optimizer = torch.optim.Adam(self.certainty.parameters(), lr=self.config.certainty_lr)
         self.run_id = f"{run_name or method}_{mode}_seed{seed}"
         if output_dir is None:
             self.log_dir = LOG_DIR
@@ -77,9 +77,11 @@ class ACPPOTrainer:
             episode_return = float(rollout.pop("episode_return"))
             episode_length = int(rollout.pop("episode_length"))
             episode_id = int(rollout.pop("episode_id"))
-            self._update(rollout)
-            self._log_update(global_step, rollout)
-            if float(rollout["certainty"].std(unbiased=False)) < 1e-8:
+            update_stats = self._update(rollout)
+            self._log_update(global_step, rollout, update_stats)
+            certainty_mean = float(rollout["certainty"].mean().item()) if rollout["certainty"].numel() else math.nan
+            certainty_std = float(rollout["certainty"].std(unbiased=False).item()) if rollout["certainty"].numel() else math.nan
+            if certainty_std < 1e-8 and (certainty_mean < 0.01 or certainty_mean > 0.99):
                 print(f"warning: certainty collapse suspected at step {global_step}")
             while global_step >= next_checkpoint_step:
                 saved_policy_checkpoints.append(self._save_checkpoint(next_checkpoint_step))
@@ -101,7 +103,8 @@ class ACPPOTrainer:
             "runtime": self._runtime_metadata(),
             "reward_semantics": SPARSE_REWARD_SEMANTICS,
             "reward_noise_semantics": "REWARD_NOISE can convert a raw terminal success into policy_success=0; no dense reward is used by PPO/GAE.",
-            "certainty_gate_semantics": "policy advantage gate uses effective_c = c * (1 - c_min) + c_min.",
+            "certainty_gate_semantics": "AC v3 uses a runner-up mixture PPO ratio with stop-gradient certainty; certainty is initialized near PPO when a pretrained anchor is used, then trained by mixture MLE plus trajectory outcome MLE for AC_FULL.",
+            "unmixed_group_semantics": "If a grouped update contains no mixed-outcome groups, the sampled batch is retained for logging/critic/certainty updates, but actor updates are skipped by default because all-success/all-fail groups have no contrast.",
         }
         self.summary_log.write_text(json.dumps(summary_with_config, indent=2), encoding="utf-8")
         self.env.close()
@@ -113,14 +116,19 @@ class ACPPOTrainer:
         cfg = self.config
         obs_buf, actions, log_probs, rewards, dones, values = [], [], [], [], [], []
         entropies, deltas, certainties = [], [], []
-        successes, outcome_masks = [], []
+        action_probs, runner_up_probs, runner_up_actions, old_mixture_probs = [], [], [], []
+        successes, outcome_masks, terminal_masks, episode_ids = [], [], [], []
         episode_rows, step_rows = [], []
         current_episode_start = 0
         for _ in range(cfg.steps_per_update):
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             with torch.no_grad():
-                action, log_prob, entropy, delta, value = self.policy.act(obs_t)
+                action, log_prob, entropy, _, value = self.policy.act(obs_t)
+                probs = self.policy.distribution(obs_t).probs
+                action_prob, runner_prob, runner_action = runner_up_stats(probs, action)
+                delta = runner_up_margin(action_prob, runner_prob)
                 certainty, _ = self.certainty(obs_t)
+                old_mixture_prob = mixture_probability(certainty, action_prob, runner_prob)
             next_obs, reward, terminated, truncated, info = self.env.step(int(action.item()))
             done = terminated or truncated
             obs_buf.append(obs)
@@ -132,9 +140,15 @@ class ACPPOTrainer:
             entropies.append(entropy.item())
             deltas.append(delta.item())
             certainties.append(certainty.item())
+            action_probs.append(action_prob.item())
+            runner_up_probs.append(runner_prob.item())
+            runner_up_actions.append(runner_action.item())
+            old_mixture_probs.append(old_mixture_prob.item())
+            episode_ids.append(episode_id)
             successes.append(0.0)
             outcome_masks.append(0.0)
-            step_rows.append([global_step, episode_id, episode_length, entropy.item(), delta.item(), certainty.item()])
+            terminal_masks.append(0.0)
+            step_rows.append([global_step, episode_id, episode_length, entropy.item(), action_prob.item(), runner_prob.item(), delta.item(), certainty.item(), old_mixture_prob.item()])
             episode_return += float(reward)
             episode_length += 1
             global_step += 1
@@ -145,6 +159,7 @@ class ACPPOTrainer:
                 for idx in range(current_episode_start, len(successes)):
                     successes[idx] = float(outcome.logged_success)
                     outcome_masks[idx] = 1.0
+                terminal_masks[-1] = 1.0
                 current_episode_start = len(successes)
                 episode_rows.append([global_step, episode_id, episode_return, outcome.logged_success, outcome.raw_success, episode_length])
                 obs, _ = self.env.reset()
@@ -167,8 +182,14 @@ class ACPPOTrainer:
             "advantages": advantages,
             "entropy_old": torch.tensor(entropies, dtype=torch.float32, device=self.device),
             "delta_old": torch.tensor(deltas, dtype=torch.float32, device=self.device),
+            "action_prob_old": torch.tensor(action_probs, dtype=torch.float32, device=self.device),
+            "runner_up_prob_old": torch.tensor(runner_up_probs, dtype=torch.float32, device=self.device),
+            "runner_up_actions": torch.tensor(runner_up_actions, dtype=torch.long, device=self.device),
+            "old_mixture_probs": torch.tensor(old_mixture_probs, dtype=torch.float32, device=self.device),
+            "episode_ids": torch.tensor(episode_ids, dtype=torch.long, device=self.device),
             "success": torch.tensor(successes, dtype=torch.float32, device=self.device),
             "outcome_mask": torch.tensor(outcome_masks, dtype=torch.float32, device=self.device),
+            "terminal_mask": torch.tensor(terminal_masks, dtype=torch.float32, device=self.device),
             "certainty": torch.tensor(certainties, dtype=torch.float32, device=self.device),
             "next_obs": obs,
             "global_step": global_step,
@@ -198,8 +219,12 @@ class ACPPOTrainer:
                 while not done:
                     obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
                     with torch.no_grad():
-                        action, log_prob, entropy, delta, value = self.policy.act(obs_t, temperature=cfg.rollout_temperature)
+                        action, log_prob, entropy, _, value = self.policy.act(obs_t, temperature=cfg.rollout_temperature)
+                        probs = self.policy.distribution(obs_t, temperature=cfg.rollout_temperature).probs
+                        action_prob, runner_prob, runner_action = runner_up_stats(probs, action)
+                        delta = runner_up_margin(action_prob, runner_prob)
                         certainty, _ = self.certainty(obs_t)
+                        old_mixture_prob = mixture_probability(certainty, action_prob, runner_prob)
                     next_obs, reward, terminated, truncated, info = self.env.step(int(action.item()))
                     done = terminated or truncated
                     group_steps.append(
@@ -212,12 +237,18 @@ class ACPPOTrainer:
                             "value": float(value.item()),
                             "entropy": float(entropy.item()),
                             "delta": float(delta.item()),
+                            "action_prob": float(action_prob.item()),
+                            "runner_up_prob": float(runner_prob.item()),
+                            "runner_up_action": int(runner_action.item()),
+                            "old_mixture_prob": float(old_mixture_prob.item()),
                             "certainty": float(certainty.item()),
                             "success": 0.0,
                             "outcome_mask": 0.0,
+                            "terminal_mask": 0.0,
+                            "episode_id": episode_id,
                         }
                     )
-                    all_step_rows.append([global_step, episode_id, episode_length, entropy.item(), delta.item(), certainty.item()])
+                    all_step_rows.append([global_step, episode_id, episode_length, entropy.item(), action_prob.item(), runner_prob.item(), delta.item(), certainty.item(), old_mixture_prob.item()])
                     episode_return += float(reward)
                     episode_length += 1
                     global_step += 1
@@ -227,6 +258,7 @@ class ACPPOTrainer:
                 for idx in range(episode_start, len(group_steps)):
                     group_steps[idx]["success"] = float(outcome.logged_success)
                     group_steps[idx]["outcome_mask"] = 1.0
+                group_steps[-1]["terminal_mask"] = 1.0
                 group_successes.append(outcome.logged_success)
                 episode_rows.append([global_step, episode_id, episode_return, outcome.logged_success, outcome.raw_success, episode_length])
                 obs, _ = self.env.reset()
@@ -266,8 +298,14 @@ class ACPPOTrainer:
             "advantages": advantages,
             "entropy_old": torch.tensor([float(s["entropy"]) for s in kept_steps], dtype=torch.float32, device=self.device),
             "delta_old": torch.tensor([float(s["delta"]) for s in kept_steps], dtype=torch.float32, device=self.device),
+            "action_prob_old": torch.tensor([float(s["action_prob"]) for s in kept_steps], dtype=torch.float32, device=self.device),
+            "runner_up_prob_old": torch.tensor([float(s["runner_up_prob"]) for s in kept_steps], dtype=torch.float32, device=self.device),
+            "runner_up_actions": torch.tensor([int(s["runner_up_action"]) for s in kept_steps], dtype=torch.long, device=self.device),
+            "old_mixture_probs": torch.tensor([float(s["old_mixture_prob"]) for s in kept_steps], dtype=torch.float32, device=self.device),
+            "episode_ids": torch.tensor([int(s["episode_id"]) for s in kept_steps], dtype=torch.long, device=self.device),
             "success": torch.tensor([float(s["success"]) for s in kept_steps], dtype=torch.float32, device=self.device),
             "outcome_mask": torch.tensor([float(s["outcome_mask"]) for s in kept_steps], dtype=torch.float32, device=self.device),
+            "terminal_mask": torch.tensor([float(s["terminal_mask"]) for s in kept_steps], dtype=torch.float32, device=self.device),
             "certainty": torch.tensor([float(s["certainty"]) for s in kept_steps], dtype=torch.float32, device=self.device),
             "group_total": torch.tensor(float(group_total), dtype=torch.float32, device=self.device),
             "group_discarded": torch.tensor(float(group_discarded), dtype=torch.float32, device=self.device),
@@ -292,65 +330,142 @@ class ACPPOTrainer:
             advantages[t] = lastgaelam
         return advantages
 
-    def _update(self, rollout: dict[str, torch.Tensor]) -> None:
+    def _update(self, rollout: dict[str, torch.Tensor]) -> dict[str, float]:
         advantages = rollout["advantages"]
+        if advantages.numel() == 0:
+            return {
+                "policy_loss": math.nan,
+                "certainty_loss": math.nan,
+                "mixture_loss": math.nan,
+                "trajectory_loss": math.nan,
+                "policy_grad_norm": math.nan,
+                "certainty_grad_norm": math.nan,
+                "mean_trajectory_certainty": math.nan,
+            }
         advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
         n = len(advantages)
         idxs = torch.arange(n, device=self.device)
+        last_policy_loss = math.nan
+        last_policy_grad_norm = math.nan
+        last_certainty_loss = math.nan
+        last_mixture_loss = math.nan
+        last_trajectory_loss = math.nan
+        last_certainty_grad_norm = math.nan
+        last_mean_trajectory_certainty = math.nan
+        skip_actor_update = (
+            self.config.skip_policy_update_on_unmixed_fallback
+            and float(rollout.get("group_total", torch.tensor(0.0, device=self.device)).item()) > 0.0
+            and float(rollout.get("group_mixed", torch.tensor(0.0, device=self.device)).item()) == 0.0
+        )
         for _ in range(self.config.update_epochs):
+            certainty, _ = self.certainty(rollout["obs"])
+            with torch.no_grad():
+                dist = self.policy.distribution(rollout["obs"])
+                probs = dist.probs
+                action_probs, runner_up_probs, _ = runner_up_stats(probs, rollout["actions"])
+            mixture_loss = mixture_mle_loss(certainty, action_probs, runner_up_probs)
+            trajectory_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+            mean_trajectory_certainty = math.nan
+            if self.method == "AC_FULL":
+                trajectory_loss = trajectory_outcome_mle_loss(
+                    certainty,
+                    rollout["episode_ids"],
+                    rollout["success"],
+                    rollout["terminal_mask"],
+                )
+                completed_means = [
+                    certainty[rollout["episode_ids"] == episode_id].mean()
+                    for episode_id in torch.unique(rollout["episode_ids"].detach())
+                    if bool(((rollout["episode_ids"] == episode_id) & rollout["terminal_mask"].bool()).any().item())
+                ]
+                if completed_means:
+                    mean_trajectory_certainty = float(torch.stack(completed_means).mean().item())
+            certainty_loss = mixture_loss + trajectory_loss
+            if not torch.isfinite(certainty_loss):
+                raise FloatingPointError("NaN loss detected")
+            self.certainty_optimizer.zero_grad()
+            certainty_loss.backward()
+            certainty_grad_norm = nn.utils.clip_grad_norm_(self.certainty.parameters(), self.config.max_grad_norm)
+            self.certainty_optimizer.step()
+            last_certainty_loss = float(certainty_loss.item())
+            last_mixture_loss = float(mixture_loss.item())
+            last_trajectory_loss = float(trajectory_loss.item())
+            last_certainty_grad_norm = float(certainty_grad_norm.item() if hasattr(certainty_grad_norm, "item") else certainty_grad_norm)
+            last_mean_trajectory_certainty = mean_trajectory_certainty
+
             perm = idxs[torch.randperm(n, device=self.device)]
             for start in range(0, n, self.config.batch_size):
                 mb = perm[start : start + self.config.batch_size]
                 obs_mb = rollout["obs"][mb]
                 actions_mb = rollout["actions"][mb]
-                certainty_mb, logits_mb = self.certainty(obs_mb)
+                runner_up_actions_mb = rollout["runner_up_actions"][mb]
+                with torch.no_grad():
+                    certainty_mb, _ = self.certainty(obs_mb)
                 dist = self.policy.distribution(obs_mb)
-                new_log_prob = dist.log_prob(actions_mb)
-                ratio = (new_log_prob - rollout["old_log_probs"][mb]).exp()
-                effective_certainty = certainty_mb.detach() * (1.0 - self.config.certainty_min_gate) + self.config.certainty_min_gate
-                gated_adv = effective_certainty * advantages[mb]
+                probs = dist.probs
+                action_probs = probs.gather(1, actions_mb.view(-1, 1)).squeeze(1)
+                runner_up_probs = probs.gather(1, runner_up_actions_mb.view(-1, 1)).squeeze(1)
+                q = mixture_probability(certainty_mb, action_probs, runner_up_probs)
+                old_q = rollout["old_mixture_probs"][mb]
+                ratio = q / old_q.clamp_min(1e-8)
                 pg_loss = -torch.min(
-                    gated_adv * ratio,
-                    gated_adv * torch.clamp(ratio, 1.0 - self.config.epsilon_low, 1.0 + self.config.epsilon_high),
+                    advantages[mb] * ratio,
+                    advantages[mb] * torch.clamp(ratio, 1.0 - self.config.epsilon_low, 1.0 + self.config.epsilon_high),
                 ).mean()
                 value_loss = nn.functional.mse_loss(self.policy.value(obs_mb), rollout["returns"][mb])
-                policy_loss = pg_loss + self.config.value_coef * value_loss - self.config.entropy_coef * dist.entropy().mean()
-                cert_terms = [
-                    alignment_loss(
-                        rollout["delta_old"][mb],
-                        certainty_mb,
-                        self.config.action_size,
-                        self.config.ac_loss_temperature,
-                    )
-                ]
-                if self.method == "AC_FULL":
-                    outcome = outcome_loss(rollout["success"][mb], certainty_mb, self.config.alpha)
-                    mask = rollout["outcome_mask"][mb]
-                    if float(mask.sum().item()) > 0.0:
-                        cert_terms.append((outcome * mask).sum() / mask.sum().clamp_min(1.0))
-                    cert_terms.append(dispersion_proxy_loss(rollout["entropy_old"][mb], logits_mb, self.config.beta))
-                certainty_loss = torch.stack([term.mean() for term in cert_terms]).sum()
-                if not torch.isfinite(policy_loss) or not torch.isfinite(certainty_loss):
+                if skip_actor_update:
+                    policy_loss = self.config.value_coef * value_loss
+                else:
+                    policy_loss = pg_loss + self.config.value_coef * value_loss - self.config.entropy_coef * dist.entropy().mean()
+                if not torch.isfinite(policy_loss):
                     raise FloatingPointError("NaN loss detected")
                 if not self.config.freeze_pretrained_policy:
                     self.policy_optimizer.zero_grad()
                     policy_loss.backward()
-                    nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+                    policy_grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
                     self.policy_optimizer.step()
-                self.certainty_optimizer.zero_grad()
-                certainty_loss.backward()
-                nn.utils.clip_grad_norm_(self.certainty.parameters(), self.config.max_grad_norm)
-                self.certainty_optimizer.step()
+                    last_policy_grad_norm = float(policy_grad_norm.item() if hasattr(policy_grad_norm, "item") else policy_grad_norm)
+                last_policy_loss = float(policy_loss.item())
+        return {
+            "policy_loss": last_policy_loss,
+            "certainty_loss": last_certainty_loss,
+            "mixture_loss": last_mixture_loss,
+            "trajectory_loss": last_trajectory_loss,
+            "policy_grad_norm": last_policy_grad_norm,
+            "certainty_grad_norm": last_certainty_grad_norm,
+            "mean_trajectory_certainty": last_mean_trajectory_certainty,
+            "policy_update_skipped": float(skip_actor_update),
+        }
 
     def _init_logs(self) -> None:
         with self.episode_log.open("w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(["step", "episode_id", "return", "success", "raw_success", "episode_length"])
         with self.step_log.open("w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["step", "episode_id", "timestep", "entropy", "delta", "certainty"])
+            csv.writer(f).writerow(["step", "episode_id", "timestep", "entropy", "action_prob", "runner_up_prob", "delta", "certainty", "mixture_prob"])
         with self.update_log.open("w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["step", "discarded_group_fraction", "mixed_group_fraction", "mean_successes_per_group", "mean_policy_entropy", "kept_steps", "used_dynamic_fallback"])
+            csv.writer(f).writerow(
+                [
+                    "step",
+                    "discarded_group_fraction",
+                    "mixed_group_fraction",
+                    "mean_successes_per_group",
+                    "mean_policy_entropy",
+                    "kept_steps",
+                    "used_dynamic_fallback",
+                    "policy_loss",
+                    "certainty_loss",
+                    "mixture_loss",
+                    "trajectory_loss",
+                    "policy_grad_norm",
+                    "certainty_grad_norm",
+                    "mean_delta",
+                    "mean_certainty",
+                    "mean_trajectory_certainty",
+                    "policy_update_skipped",
+                ]
+            )
 
-    def _log_update(self, global_step: int, rollout: dict[str, torch.Tensor]) -> None:
+    def _log_update(self, global_step: int, rollout: dict[str, torch.Tensor], update_stats: dict[str, float]) -> None:
         group_total = float(rollout["group_total"].item())
         group_discarded = float(rollout["group_discarded"].item())
         group_mixed = float(rollout["group_mixed"].item())
@@ -363,6 +478,16 @@ class ACPPOTrainer:
             float(rollout["entropy_old"].mean().item()) if rollout["entropy_old"].numel() else math.nan,
             int(rollout["obs"].shape[0]),
             int(float(rollout["used_dynamic_fallback"].item())),
+            update_stats.get("policy_loss", math.nan),
+            update_stats.get("certainty_loss", math.nan),
+            update_stats.get("mixture_loss", math.nan),
+            update_stats.get("trajectory_loss", math.nan),
+            update_stats.get("policy_grad_norm", math.nan),
+            update_stats.get("certainty_grad_norm", math.nan),
+            float(rollout["delta_old"].mean().item()) if rollout["delta_old"].numel() else math.nan,
+            float(rollout["certainty"].mean().item()) if rollout["certainty"].numel() else math.nan,
+            update_stats.get("mean_trajectory_certainty", math.nan),
+            update_stats.get("policy_update_skipped", 0.0),
         ]
         self._append_rows(self.update_log, [row])
 
@@ -376,7 +501,17 @@ class ACPPOTrainer:
         if not self.config.pretrained_policy_path:
             return
         state = torch.load(Path(self.config.pretrained_policy_path), map_location=self.device)
-        self.policy.load_state_dict(state)
+        if self.config.load_pretrained_critic:
+            self.policy.load_state_dict(state)
+        else:
+            actor_state = {key: value for key, value in state.items() if key.startswith("actor.")}
+            missing, unexpected = self.policy.load_state_dict(actor_state, strict=False)
+            unexpected = [key for key in unexpected if not key.startswith("critic.")]
+            if unexpected:
+                raise RuntimeError(f"Unexpected pretrained actor keys: {unexpected}")
+            missing = [key for key in missing if key.startswith("actor.")]
+            if missing:
+                raise RuntimeError(f"Missing pretrained actor keys: {missing}")
         if self.config.freeze_pretrained_policy:
             for parameter in self.policy.parameters():
                 parameter.requires_grad_(False)
@@ -388,6 +523,7 @@ class ACPPOTrainer:
             "torch": torch.__version__,
             "device": str(self.device),
             "pretrained_policy_path": self.config.pretrained_policy_path,
+            "load_pretrained_critic": self.config.load_pretrained_critic,
             "freeze_pretrained_policy": self.config.freeze_pretrained_policy,
         }
 

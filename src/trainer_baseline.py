@@ -444,7 +444,17 @@ class PPOBaselineTrainer:
         if not self.config.pretrained_policy_path:
             return
         state = torch.load(Path(self.config.pretrained_policy_path), map_location=self.device)
-        self.policy.load_state_dict(state)
+        if self.config.load_pretrained_critic:
+            self.policy.load_state_dict(state)
+        else:
+            actor_state = {key: value for key, value in state.items() if key.startswith("actor.")}
+            missing, unexpected = self.policy.load_state_dict(actor_state, strict=False)
+            unexpected = [key for key in unexpected if not key.startswith("critic.")]
+            if unexpected:
+                raise RuntimeError(f"Unexpected pretrained actor keys: {unexpected}")
+            missing = [key for key in missing if key.startswith("actor.")]
+            if missing:
+                raise RuntimeError(f"Missing pretrained actor keys: {missing}")
         if self.config.freeze_pretrained_policy:
             for parameter in self.policy.parameters():
                 parameter.requires_grad_(False)
@@ -456,6 +466,7 @@ class PPOBaselineTrainer:
             "torch": torch.__version__,
             "device": str(self.device),
             "pretrained_policy_path": self.config.pretrained_policy_path,
+            "load_pretrained_critic": self.config.load_pretrained_critic,
             "freeze_pretrained_policy": self.config.freeze_pretrained_policy,
         }
 

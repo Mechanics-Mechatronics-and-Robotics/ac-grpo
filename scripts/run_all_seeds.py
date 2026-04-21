@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from src.config import BASELINE_EXPERIMENTS, DEFAULT_PRETRAINED_POLICY, FINAL_EXPERIMENT_GRID, METHOD_MODE_EXPERIMENTS, OUTPUTS_DIR, SEEDS
+from src.config import BASELINE_EXPERIMENTS, DEFAULT_PRETRAINED_POLICY, FINAL_EXPERIMENT_GRID, METHOD_MODE_EXPERIMENTS, OUTPUTS_DIR, SEEDS, TrainConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,6 +118,7 @@ def run_one_experiment(
 ) -> Path:
     experiments = {**BASELINE_EXPERIMENTS, **METHOD_MODE_EXPERIMENTS}
     settings = dict(experiments[experiment_name])
+    config_defaults = TrainConfig()
     method = str(settings.get("method", "BASELINE"))
     if total_steps_override is not None:
         settings["total_steps"] = total_steps_override
@@ -178,10 +179,18 @@ def run_one_experiment(
                 str(seed),
                 "--total-steps",
                 str(settings["total_steps"]),
+                "--policy-lr",
+                str(settings.get("policy_lr", config_defaults.policy_lr)),
+                "--certainty-lr",
+                str(settings.get("certainty_lr", config_defaults.certainty_lr)),
                 "--group-size",
                 str(settings.get("group_size", 4)),
                 "--rollout-temperature",
                 str(settings["rollout_temperature"]),
+                "--epsilon-low",
+                str(settings["epsilon_low"]),
+                "--epsilon-high",
+                str(settings["epsilon_high"]),
                 "--dynamic-sampling-warmup-steps",
                 str(settings.get("dynamic_sampling_warmup_steps", 0)),
                 "--output-dir",
