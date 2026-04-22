@@ -22,6 +22,7 @@ SPARSE_REWARD_SEMANTICS = (
     "Sparse terminal reward for learning: r_t_train=0 before episode end and "
     "r_T_train=policy_success at termination. Dense LunarLander return is logged only."
 )
+DENSE_REWARD_SEMANTICS = "Dense reward for learning: r_t_train=r_t_env at every step."
 
 
 def set_seed(seed: int) -> None:
@@ -70,6 +71,11 @@ class PPOBaselineTrainer:
         self.step_log = self.log_dir / f"{self.run_id}_steps.csv"
         self.update_log = self.log_dir / f"{self.run_id}_updates.csv"
         self.summary_log = self.log_dir / f"{self.run_id}_summary.json"
+
+    def _train_reward(self, env_reward: float, done: bool, outcome_policy_success: float) -> float:
+        if self.config.reward_mode == "DENSE":
+            return float(env_reward)
+        return float(outcome_policy_success) if done else 0.0
 
     def train(self) -> dict[str, float]:
         self._init_logs()
@@ -122,8 +128,9 @@ class PPOBaselineTrainer:
             **summary,
             "config": asdict(self.config),
             "runtime": self._runtime_metadata(),
-            "reward_semantics": SPARSE_REWARD_SEMANTICS,
-            "reward_noise_semantics": "REWARD_NOISE can convert a raw terminal success into policy_success=0; no dense reward is used by PPO/GAE.",
+            "reward_mode": self.config.reward_mode,
+            "reward_semantics": DENSE_REWARD_SEMANTICS if self.config.reward_mode == "DENSE" else SPARSE_REWARD_SEMANTICS,
+            "reward_noise_semantics": "REWARD_NOISE can convert a raw terminal success into policy_success=0; sparse mode flips the terminal binary reward, dense mode leaves per-step shaping intact and only affects the binary outcome label.",
         }
         self.summary_log.write_text(json.dumps(summary_with_config, indent=2), encoding="utf-8")
         self.env.close()
@@ -137,6 +144,7 @@ class PPOBaselineTrainer:
         entropies, deltas, episode_ids, timesteps = [], [], [], []
         step_rows = []
         episode_rows = []
+        episode_train_return = 0.0
         for _ in range(min(cfg.steps_per_update, step_budget)):
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             with torch.no_grad():
@@ -146,7 +154,7 @@ class PPOBaselineTrainer:
             obs_buf.append(obs)
             actions.append(action.item())
             log_probs.append(log_prob.item())
-            rewards.append(0.0)
+            rewards.append(self._train_reward(reward, done, 0.0))
             dones.append(float(done))
             values.append(value.item())
             entropies.append(entropy.item())
@@ -158,12 +166,18 @@ class PPOBaselineTrainer:
             episode_length += 1
             global_step += 1
             obs = next_obs
+            episode_train_return += rewards[-1]
             if done:
                 outcome = self.env.episode_outcome(episode_return, info)
-                rewards[-1] = float(outcome.policy_success)
-                episode_rows.append([global_step, episode_id, episode_return, outcome.logged_success, outcome.raw_success, episode_length])
+                rewards[-1] = self._train_reward(reward, done, float(outcome.policy_success))
+                if self.config.reward_mode == "SPARSE":
+                    episode_train_return += rewards[-1]
+                else:
+                    episode_train_return += rewards[-1] - float(reward)
+                episode_rows.append([global_step, episode_id, episode_return, episode_train_return, outcome.logged_success, outcome.raw_success, episode_length])
                 obs, _ = self.env.reset()
                 episode_return = 0.0
+                episode_train_return = 0.0
                 episode_length = 0
                 episode_id += 1
         self._append_rows(self.step_log, step_rows)
@@ -233,6 +247,7 @@ class PPOBaselineTrainer:
         group_success_counts: list[float] = []
         attempts = 0
         target_steps = min(cfg.steps_per_update, step_budget)
+        episode_train_return = 0.0
         while global_step < self.config.total_steps and len(all_step_rows) < target_steps and attempts < cfg.max_group_attempts_per_update:
             attempts += 1
             group_steps: list[dict[str, float | int | np.ndarray]] = []
@@ -249,12 +264,13 @@ class PPOBaselineTrainer:
                         action, log_prob, entropy, delta, value = self.policy.act(obs_t, temperature=cfg.rollout_temperature)
                     next_obs, reward, terminated, truncated, info = self.env.step(int(action.item()))
                     done = terminated or truncated
+                    train_reward = self._train_reward(reward, done, 0.0)
                     group_steps.append(
                         {
                             "obs": obs,
                             "action": int(action.item()),
                             "log_prob": float(log_prob.item()),
-                            "reward": 0.0,
+                            "reward": train_reward,
                             "done": float(done),
                             "value": float(value.item()),
                             "entropy": float(entropy.item()),
@@ -265,18 +281,24 @@ class PPOBaselineTrainer:
                         }
                     )
                     all_step_rows.append([global_step, episode_id, episode_length, entropy.item(), delta.item(), ""])
+                    episode_train_return += train_reward
                     episode_return += float(reward)
                     episode_length += 1
                     global_step += 1
                     obs = next_obs
                 outcome = self.env.episode_outcome(episode_return, info)
-                group_steps[-1]["reward"] = float(outcome.policy_success)
+                group_steps[-1]["reward"] = self._train_reward(reward, done, float(outcome.policy_success))
+                if cfg.reward_mode == "SPARSE":
+                    episode_train_return += group_steps[-1]["reward"]
+                else:
+                    episode_train_return += group_steps[-1]["reward"] - float(reward)
                 for idx in range(episode_start, len(group_steps)):
                     group_steps[idx]["episode_success"] = float(outcome.logged_success)
                 group_successes.append(outcome.logged_success)
-                episode_rows.append([global_step, episode_id, episode_return, outcome.logged_success, outcome.raw_success, episode_length])
+                episode_rows.append([global_step, episode_id, episode_return, episode_train_return, outcome.logged_success, outcome.raw_success, episode_length])
                 obs, _ = self.env.reset()
                 episode_return = 0.0
+                episode_train_return = 0.0
                 episode_length = 0
                 episode_id += 1
             group_total += 1
@@ -393,7 +415,7 @@ class PPOBaselineTrainer:
 
     def _init_logs(self) -> None:
         with self.episode_log.open("w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["step", "episode_id", "return", "success", "raw_success", "episode_length"])
+            csv.writer(f).writerow(["step", "episode_id", "return_env", "return_train", "outcome_policy", "outcome_raw", "episode_length"])
         with self.step_log.open("w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(["step", "episode_id", "timestep", "entropy", "delta", "certainty"])
         with self.update_log.open("w", newline="", encoding="utf-8") as f:

@@ -16,7 +16,7 @@ from src.certainty_net import CertaintyNet
 from src.config import CHECKPOINT_DIR, LOG_DIR, TrainConfig, ensure_output_dirs
 from src.env import LunarLanderDiagnosticEnv
 from src.evaluation import evaluate_policy_checkpoint
-from src.losses import mixture_nll, outcome_nll, runner_up_stats
+from src.losses import mixture_nll, outcome_nll, per_episode_mixture_nll, runner_up_stats
 from src.policy_net import PolicyNet
 from src.trainer_baseline import SPARSE_REWARD_SEMANTICS, set_seed
 
@@ -36,6 +36,11 @@ class ACPPOTrainer:
     ) -> torch.Tensor:
         c = certainty.clamp(eps, 1.0 - eps)
         return (c * action_probs + (1.0 - c) * runner_up_probs).clamp_min(eps)
+
+    def _train_reward(self, env_reward: float, done: bool, outcome_policy_success: float) -> float:
+        if self.config.reward_mode == "DENSE":
+            return float(env_reward)
+        return float(outcome_policy_success) if done else 0.0
 
     def __init__(
         self,
@@ -117,9 +122,10 @@ class ACPPOTrainer:
             **summary,
             "config": asdict(self.config),
             "runtime": self._runtime_metadata(),
-            "reward_semantics": SPARSE_REWARD_SEMANTICS,
-            "reward_noise_semantics": "REWARD_NOISE can convert a raw terminal success into policy_success=0; no dense reward is used by PPO/GAE.",
-            "certainty_gate_semantics": "AC v3 uses a runner-up mixture PPO ratio with stop-gradient certainty; certainty is learned by its own network from random initialization via mixture NLL, plus trajectory outcome NLL for AC_FULL.",
+            "reward_mode": self.config.reward_mode,
+            "reward_semantics": "Dense reward for learning: r_t_train=r_t_env at every step." if self.config.reward_mode == "DENSE" else SPARSE_REWARD_SEMANTICS,
+            "reward_noise_semantics": "REWARD_NOISE can convert a raw terminal success into policy_success=0; sparse mode flips the terminal binary reward, dense mode leaves per-step shaping intact and only affects the binary outcome label.",
+            "certainty_gate_semantics": "AC uses standard PPO with detached certainty-gated advantages; runner-up statistics are used only to train the certainty network.",
             "unmixed_group_semantics": "If a grouped update contains no mixed-outcome groups, the sampled batch is retained for logging/critic/certainty updates, but actor updates are skipped by default because all-success/all-fail groups have no contrast.",
         }
         self.summary_log.write_text(json.dumps(summary_with_config, indent=2), encoding="utf-8")
@@ -136,6 +142,7 @@ class ACPPOTrainer:
         successes, outcome_masks, terminal_masks, episode_ids = [], [], [], []
         episode_rows, step_rows = [], []
         current_episode_start = 0
+        episode_train_return = 0.0
         for _ in range(cfg.steps_per_update):
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             with torch.no_grad():
@@ -150,7 +157,7 @@ class ACPPOTrainer:
             obs_buf.append(obs)
             actions.append(action.item())
             log_probs.append(log_prob.item())
-            rewards.append(0.0)
+            rewards.append(self._train_reward(reward, done, 0.0))
             dones.append(float(done))
             values.append(value.item())
             entropies.append(entropy.item())
@@ -165,21 +172,27 @@ class ACPPOTrainer:
             outcome_masks.append(0.0)
             terminal_masks.append(0.0)
             step_rows.append([global_step, episode_id, episode_length, entropy.item(), action_prob.item(), runner_prob.item(), delta.item(), certainty.item(), old_mixture_prob.item()])
+            episode_train_return += rewards[-1]
             episode_return += float(reward)
             episode_length += 1
             global_step += 1
             obs = next_obs
             if done:
                 outcome = self.env.episode_outcome(episode_return, info)
-                rewards[-1] = float(outcome.policy_success)
+                rewards[-1] = self._train_reward(reward, done, float(outcome.policy_success))
+                if cfg.reward_mode == "SPARSE":
+                    episode_train_return += rewards[-1]
+                else:
+                    episode_train_return += rewards[-1] - float(reward)
                 for idx in range(current_episode_start, len(successes)):
                     successes[idx] = float(outcome.logged_success)
                     outcome_masks[idx] = 1.0
                 terminal_masks[-1] = 1.0
                 current_episode_start = len(successes)
-                episode_rows.append([global_step, episode_id, episode_return, outcome.logged_success, outcome.raw_success, episode_length])
+                episode_rows.append([global_step, episode_id, episode_return, episode_train_return, outcome.logged_success, outcome.raw_success, episode_length])
                 obs, _ = self.env.reset()
                 episode_return = 0.0
+                episode_train_return = 0.0
                 episode_length = 0
                 episode_id += 1
         self._append_rows(self.step_log, step_rows)
@@ -226,6 +239,7 @@ class ACPPOTrainer:
         group_mixed = 0
         group_success_counts: list[float] = []
         target_steps = min(cfg.steps_per_update, cfg.total_steps - global_step)
+        episode_train_return = 0.0
         while global_step < cfg.total_steps and len(all_step_rows) < target_steps:
             group_steps: list[dict[str, float | int | np.ndarray]] = []
             group_successes: list[int] = []
@@ -243,12 +257,13 @@ class ACPPOTrainer:
                         old_mixture_prob = self._mixture_probability(certainty, action_prob, runner_prob)
                     next_obs, reward, terminated, truncated, info = self.env.step(int(action.item()))
                     done = terminated or truncated
+                    train_reward = self._train_reward(reward, done, 0.0)
                     group_steps.append(
                         {
                             "obs": obs,
                             "action": int(action.item()),
                             "log_prob": float(log_prob.item()),
-                            "reward": 0.0,
+                            "reward": train_reward,
                             "done": float(done),
                             "value": float(value.item()),
                             "entropy": float(entropy.item()),
@@ -265,20 +280,26 @@ class ACPPOTrainer:
                         }
                     )
                     all_step_rows.append([global_step, episode_id, episode_length, entropy.item(), action_prob.item(), runner_prob.item(), delta.item(), certainty.item(), old_mixture_prob.item()])
+                    episode_train_return += train_reward
                     episode_return += float(reward)
                     episode_length += 1
                     global_step += 1
                     obs = next_obs
                 outcome = self.env.episode_outcome(episode_return, info)
-                group_steps[-1]["reward"] = float(outcome.policy_success)
+                group_steps[-1]["reward"] = self._train_reward(reward, done, float(outcome.policy_success))
+                if cfg.reward_mode == "SPARSE":
+                    episode_train_return += group_steps[-1]["reward"]
+                else:
+                    episode_train_return += group_steps[-1]["reward"] - float(reward)
                 for idx in range(episode_start, len(group_steps)):
                     group_steps[idx]["success"] = float(outcome.logged_success)
                     group_steps[idx]["outcome_mask"] = 1.0
                 group_steps[-1]["terminal_mask"] = 1.0
                 group_successes.append(outcome.logged_success)
-                episode_rows.append([global_step, episode_id, episode_return, outcome.logged_success, outcome.raw_success, episode_length])
+                episode_rows.append([global_step, episode_id, episode_return, episode_train_return, outcome.logged_success, outcome.raw_success, episode_length])
                 obs, _ = self.env.reset()
                 episode_return = 0.0
+                episode_train_return = 0.0
                 episode_length = 0
                 episode_id += 1
             group_total += 1
@@ -352,11 +373,11 @@ class ACPPOTrainer:
             return {
                 "policy_loss": math.nan,
                 "certainty_loss": math.nan,
-                "mixture_loss": math.nan,
-                "trajectory_loss": math.nan,
-                "policy_grad_norm": math.nan,
-                "certainty_grad_norm": math.nan,
-                "mean_trajectory_certainty": math.nan,
+                "cert_loss_step": math.nan,
+                "cert_loss_traj": math.nan,
+                "grad_norm_theta": math.nan,
+                "grad_norm_psi": math.nan,
+                "c_bar_mean": math.nan,
             }
         advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
         n = len(advantages)
@@ -370,6 +391,8 @@ class ACPPOTrainer:
         last_mean_trajectory_certainty = math.nan
         ratio_means: list[float] = []
         ratio_maxes: list[float] = []
+        delta_mins: list[float] = []
+        delta_maxes: list[float] = []
         skip_actor_update = (
             self.config.skip_policy_update_on_unmixed_fallback
             and float(rollout.get("group_total", torch.tensor(0.0, device=self.device)).item()) > 0.0
@@ -385,20 +408,19 @@ class ACPPOTrainer:
                 self.policy_optimizer.zero_grad()
                 self.certainty_optimizer.zero_grad()
                 dist = self.policy.distribution(obs_mb)
-                probs = F.softmax(dist.logits, dim=1)
+                new_log_prob = dist.log_prob(actions_mb)
+                ratio = (new_log_prob - rollout["old_log_probs"][mb]).exp()
                 certainty_mb, _ = self.certainty(obs_mb)
-                action_probs = probs.gather(1, actions_mb.view(-1, 1)).squeeze(1)
-                runner_up_probs = probs.gather(1, runner_up_actions_mb.view(-1, 1)).squeeze(1)
-                q = self._mixture_probability(certainty_mb, action_probs, runner_up_probs)
-                old_q = rollout["old_mixture_probs"][mb]
-                ratio = q / old_q.clamp_min(1e-8)
                 mixture_ratio_mean = ratio.mean().item()
                 mixture_ratio_max = ratio.abs().max().item()
                 ratio_means.append(float(mixture_ratio_mean))
                 ratio_maxes.append(float(mixture_ratio_max))
+                delta_mins.append(float(rollout["delta_old"][mb].min().item()))
+                delta_maxes.append(float(rollout["delta_old"][mb].max().item()))
+                gated_advantages = certainty_mb.detach() * advantages[mb]
                 pg_loss = -torch.min(
-                    advantages[mb] * ratio,
-                    advantages[mb] * torch.clamp(ratio, 1.0 - self.config.epsilon_low, 1.0 + self.config.epsilon_high),
+                    gated_advantages * ratio,
+                    gated_advantages * torch.clamp(ratio, 1.0 - self.config.epsilon_low, 1.0 + self.config.epsilon_high),
                 ).mean()
                 value_loss = nn.functional.mse_loss(self.policy.value(obs_mb), rollout["returns"][mb])
                 if skip_actor_update:
@@ -408,7 +430,7 @@ class ACPPOTrainer:
                 if not torch.isfinite(policy_loss):
                     raise FloatingPointError("NaN loss detected")
                 if not self.config.freeze_pretrained_policy:
-                    policy_loss.backward(retain_graph=True)
+                    policy_loss.backward()
                     policy_grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
                     self.policy_optimizer.step()
                     last_policy_grad_norm = float(policy_grad_norm.item() if hasattr(policy_grad_norm, "item") else policy_grad_norm)
@@ -419,10 +441,15 @@ class ACPPOTrainer:
             probs_cert = F.softmax(dist_cert.logits, dim=1)
             certainty_cert, _ = self.certainty(rollout["obs"])
             action_probs_cert, runner_up_probs_cert, _ = runner_up_stats(probs_cert, rollout["actions"])
-            mixture_loss = mixture_nll(certainty_cert, action_probs_cert, runner_up_probs_cert)
+            mixture_loss = per_episode_mixture_nll(
+                certainty_cert,
+                action_probs_cert,
+                runner_up_probs_cert,
+                rollout["episode_ids"],
+            )
             trajectory_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
             mean_trajectory_certainty = math.nan
-            if self.method == "AC_FULL":
+            if self.method == "AC_FULL" and self.config.reward_mode == "SPARSE":
                 trajectory_loss = outcome_nll(
                     certainty_cert,
                     rollout["episode_ids"],
@@ -451,19 +478,21 @@ class ACPPOTrainer:
         return {
             "policy_loss": last_policy_loss,
             "certainty_loss": last_certainty_loss,
-            "mixture_loss": last_mixture_loss,
-            "trajectory_loss": last_trajectory_loss,
-            "policy_grad_norm": last_policy_grad_norm,
-            "certainty_grad_norm": last_certainty_grad_norm,
-            "mean_trajectory_certainty": last_mean_trajectory_certainty,
+            "cert_loss_step": last_mixture_loss,
+            "cert_loss_traj": last_trajectory_loss,
+            "grad_norm_theta": last_policy_grad_norm,
+            "grad_norm_psi": last_certainty_grad_norm,
+            "c_bar_mean": last_mean_trajectory_certainty,
             "policy_update_skipped": float(skip_actor_update),
             "mixture_ratio_mean": (sum(ratio_means) / len(ratio_means)) if ratio_means else math.nan,
             "mixture_ratio_max": max(ratio_maxes) if ratio_maxes else math.nan,
+            "delta_min": min(delta_mins) if delta_mins else math.nan,
+            "delta_max": max(delta_maxes) if delta_maxes else math.nan,
         }
 
     def _init_logs(self) -> None:
         with self.episode_log.open("w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["step", "episode_id", "return", "success", "raw_success", "episode_length"])
+            csv.writer(f).writerow(["step", "episode_id", "return_env", "return_train", "outcome_policy", "outcome_raw", "episode_length"])
         with self.step_log.open("w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(["step", "episode_id", "timestep", "entropy", "action_prob", "runner_up_prob", "delta", "certainty", "mixture_prob"])
         with self.update_log.open("w", newline="", encoding="utf-8") as f:
@@ -475,19 +504,22 @@ class ACPPOTrainer:
                     "mean_successes_per_group",
                     "mean_policy_entropy",
                     "kept_steps",
-                    "used_dynamic_fallback",
+                    "fallback_used",
                     "policy_loss",
                     "certainty_loss",
-                    "mixture_loss",
-                    "trajectory_loss",
-                    "policy_grad_norm",
-                    "certainty_grad_norm",
+                    "cert_loss_step",
+                    "cert_loss_traj",
+                    "grad_norm_theta",
+                    "grad_norm_psi",
                     "mean_delta",
-                    "mean_certainty",
-                    "mean_trajectory_certainty",
+                    "delta_min",
+                    "delta_max",
+                    "certainty_mean",
+                    "c_bar_mean",
                     "policy_update_skipped",
                     "mixture_ratio_mean",
                     "mixture_ratio_max",
+                    "kept_steps_frac",
                 ]
             )
 
@@ -506,16 +538,19 @@ class ACPPOTrainer:
             int(float(rollout["used_dynamic_fallback"].item())),
             update_stats.get("policy_loss", math.nan),
             update_stats.get("certainty_loss", math.nan),
-            update_stats.get("mixture_loss", math.nan),
-            update_stats.get("trajectory_loss", math.nan),
-            update_stats.get("policy_grad_norm", math.nan),
-            update_stats.get("certainty_grad_norm", math.nan),
+            update_stats.get("cert_loss_step", math.nan),
+            update_stats.get("cert_loss_traj", math.nan),
+            update_stats.get("grad_norm_theta", math.nan),
+            update_stats.get("grad_norm_psi", math.nan),
             float(rollout["delta_old"].mean().item()) if rollout["delta_old"].numel() else math.nan,
+            update_stats.get("delta_min", math.nan),
+            update_stats.get("delta_max", math.nan),
             float(rollout["certainty"].mean().item()) if rollout["certainty"].numel() else math.nan,
-            update_stats.get("mean_trajectory_certainty", math.nan),
+            update_stats.get("c_bar_mean", math.nan),
             update_stats.get("policy_update_skipped", 0.0),
             update_stats.get("mixture_ratio_mean", math.nan),
             update_stats.get("mixture_ratio_max", math.nan),
+            1.0 - (group_discarded / group_total if group_total else 0.0),
         ]
         self._append_rows(self.update_log, [row])
 

@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from src.config import BASELINE_EXPERIMENTS, DEFAULT_PRETRAINED_POLICY, FINAL_EXPERIMENT_GRID, METHOD_MODE_EXPERIMENTS, OUTPUTS_DIR, SEEDS, TrainConfig
+from src.config import BASELINE_EXPERIMENTS, DEFAULT_PRETRAINED_POLICY, FINAL_EXPERIMENT_GRID, METHOD_MODE_EXPERIMENTS, OUTPUTS_DIR, REWARD_MODES, SEEDS, TrainConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freeze-pretrained-policy", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="Run seed 42 only.")
     parser.add_argument("--max-parallel-seeds", type=int, default=None, help="Run up to this many seeds concurrently. Defaults to all selected seeds.")
+    parser.add_argument("--reward-mode", choices=REWARD_MODES, default=None, help="Override the experiment reward mode.")
     return parser.parse_args()
 
 
@@ -65,6 +66,8 @@ def build_seed_command(
             "scripts/train_baseline.py",
             "--mode",
             str(settings["mode"]),
+            "--reward-mode",
+            str(settings.get("reward_mode", config_defaults.reward_mode)),
             "--seed",
             str(seed),
             "--total-steps",
@@ -100,6 +103,8 @@ def build_seed_command(
         method,
         "--mode",
         str(settings["mode"]),
+        "--reward-mode",
+        str(settings.get("reward_mode", config_defaults.reward_mode)),
         "--seed",
         str(seed),
         "--total-steps",
@@ -173,8 +178,8 @@ def summarize_seed(seed_dir: Path, seed: int) -> dict[str, float | int]:
             episodes = list(csv.DictReader(f))
         tail = episodes[-20:] if len(episodes) >= 20 else episodes
         if tail:
-            returns = [float(r["return"]) for r in tail]
-            successes = [float(r["success"]) for r in tail]
+            returns = [float(r.get("return_env", r.get("return", "nan"))) for r in tail]
+            successes = [float(r.get("outcome_policy", r.get("success", "nan"))) for r in tail]
             row["final_return_last20"] = sum(returns) / len(returns)
             row["final_success_last20"] = sum(successes) / len(successes)
         row["episodes"] = len(episodes)
@@ -232,6 +237,7 @@ def run_one_experiment(
     pretrained_policy_path: str | None,
     freeze_pretrained_policy: bool,
     max_parallel_seeds: int,
+    reward_mode_override: str | None,
 ) -> Path:
     experiments = {**BASELINE_EXPERIMENTS, **METHOD_MODE_EXPERIMENTS}
     settings = dict(experiments[experiment_name])
@@ -239,6 +245,8 @@ def run_one_experiment(
     method = str(settings.get("method", "BASELINE"))
     if total_steps_override is not None:
         settings["total_steps"] = total_steps_override
+    if reward_mode_override is not None:
+        settings["reward_mode"] = reward_mode_override
     run_dir = parent_dir / experiment_name
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "plots").mkdir()
@@ -285,6 +293,7 @@ def main() -> None:
         "experiments": names,
         "seeds": list(seeds),
         "total_steps_override": args.total_steps,
+        "reward_mode_override": args.reward_mode,
         "pretrained_policy_path": args.pretrained_policy_path,
         "freeze_pretrained_policy": args.freeze_pretrained_policy,
     })
@@ -299,6 +308,7 @@ def main() -> None:
             pretrained_policy_path=args.pretrained_policy_path,
             freeze_pretrained_policy=args.freeze_pretrained_policy,
             max_parallel_seeds=max_parallel_seeds,
+            reward_mode_override=args.reward_mode,
         )
         for name in names
     ]
@@ -306,6 +316,7 @@ def main() -> None:
         "experiments": names,
         "run_dirs": [str(path) for path in run_dirs],
         "seeds": list(seeds),
+        "reward_mode": args.reward_mode,
         "pretrained_policy_path": args.pretrained_policy_path,
         "freeze_pretrained_policy": args.freeze_pretrained_policy,
     }

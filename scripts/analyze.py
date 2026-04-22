@@ -54,6 +54,12 @@ def load_logs(log_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     episode_frames = []
     for path in log_dir.rglob("*_episodes.csv"):
         df = pd.read_csv(path)
+        if "return_env" in df.columns and "return" not in df.columns:
+            df["return"] = pd.to_numeric(df["return_env"], errors="coerce")
+        if "outcome_policy" in df.columns and "success" not in df.columns:
+            df["success"] = pd.to_numeric(df["outcome_policy"], errors="coerce")
+        if "outcome_raw" in df.columns and "raw_success" not in df.columns:
+            df["raw_success"] = pd.to_numeric(df["outcome_raw"], errors="coerce")
         method, mode, seed = parse_run_name(path)
         df["method"], df["mode"], df["seed"] = method, mode, seed
         episode_frames.append(df)
@@ -408,10 +414,10 @@ def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, report_dir: Path) 
         "",
         "## Notes on experimental modes",
         "",
-        "- **Reward semantics**: PPO/GAE uses sparse terminal binary reward only (`0` before termination, terminal `policy_success` at episode end); dense LunarLander return is logged for diagnostics only.",
-        "- **REWARD_NOISE**: false-negative successes set terminal `policy_success` to `0`, so the sparse policy update sees the corrupted outcome directly.",
+        "- **Reward semantics**: logs include `return_train` (optimizer reward) and `return_env` (raw dense environment return). Plot/report curves use `return_env` unless stated otherwise.",
+        "- **REWARD_NOISE**: false-negative successes set terminal `policy_success` to `0` during training. Checkpoint selection evaluates on clean held-out episodes because reward noise is training-only corruption.",
         "- **OBS_NOISE**: adds Gaussian noise \(\\sigma=0.1\\) to observations at every step.",
-        "- **AC v3**: AC methods use runner-up mixture PPO; `delta` is the normalized executed-vs-runner-up margin, and `mixture_prob` is the likelihood used by the AC ratio.",
+        "- **AC v3**: AC methods use standard PPO with certainty-gated advantages; runner-up statistics supervise the certainty network only.",
         "",
         "## Seed aggregation",
         "",

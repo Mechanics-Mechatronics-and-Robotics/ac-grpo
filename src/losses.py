@@ -53,6 +53,32 @@ def mixture_nll(
     return -torch.log(mixture.clamp_min(eps)).mean()
 
 
+def per_episode_mixture_nll(
+    certainty: torch.Tensor,
+    action_probs: torch.Tensor,
+    runner_up_probs: torch.Tensor,
+    episode_ids: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Episode-normalized runner-up mixture NLL.
+
+    Computes the mean per-step mixture NLL within each episode, then averages
+    those episode losses so the certainty step loss is commensurate with the
+    trajectory outcome loss in AC_FULL.
+    """
+    c = certainty.clamp(eps, 1.0 - eps)
+    mixture = c * action_probs + (1.0 - c) * runner_up_probs
+    step_nll = -torch.log(mixture.clamp_min(eps))
+    losses: list[torch.Tensor] = []
+    for eid in torch.unique(episode_ids):
+        ep = episode_ids == eid
+        if bool(ep.any().item()):
+            losses.append(step_nll[ep].mean())
+    if not losses:
+        return torch.zeros((), dtype=certainty.dtype, device=certainty.device)
+    return torch.stack(losses).mean()
+
+
 def outcome_nll(
     certainty: torch.Tensor,
     episode_ids: torch.Tensor,

@@ -6,6 +6,7 @@ from pathlib import Path
 
 SEEDS = (42, 0, 17, 9, 3)
 MODES = ("CLEAN", "REWARD_NOISE", "OBS_NOISE")
+REWARD_MODES = ("SPARSE", "DENSE")
 METHODS = ("BASELINE", "AC_LITE", "AC_FULL")
 FINAL_EXPERIMENT_GRID = (
     "baseline_clean",
@@ -33,6 +34,7 @@ BEST_EXPERIMENT_SETTINGS = {
     "epsilon_high": 0.2,
     "total_steps": 250_000,
     "dynamic_sampling_warmup_steps": 10_000,
+    "reward_mode": "SPARSE",
 }
 BEST_BASELINE_REPAIR = BEST_EXPERIMENT_SETTINGS
 BASELINE_EXPERIMENTS = {
@@ -55,6 +57,7 @@ METHOD_MODE_EXPERIMENTS = {
 @dataclass(frozen=True)
 class TrainConfig:
     env_id: str = "LunarLander-v2"
+    reward_mode: str = "SPARSE"
     steps_per_update: int = 2048
     batch_size: int = 64
     total_steps: int = 60_000

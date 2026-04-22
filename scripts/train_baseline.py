@@ -6,13 +6,14 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from src.config import MODES, TrainConfig
+from src.config import MODES, REWARD_MODES, TrainConfig
 from src.trainer_baseline import PPOBaselineTrainer
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train BASELINE PPO on LunarLander-v2.")
     parser.add_argument("--mode", choices=MODES, default="CLEAN")
+    parser.add_argument("--reward-mode", choices=REWARD_MODES, default=TrainConfig().reward_mode)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--total-steps", type=int, default=TrainConfig().total_steps)
     parser.add_argument("--grouped-rollouts", action="store_true")
@@ -34,6 +35,7 @@ def main() -> None:
     args = parse_args()
     config = TrainConfig(
         total_steps=args.total_steps,
+        reward_mode=args.reward_mode,
         grouped_rollouts=args.grouped_rollouts,
         dynamic_sampling=args.dynamic_sampling,
         group_size=args.group_size,

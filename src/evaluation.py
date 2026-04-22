@@ -19,6 +19,7 @@ def evaluate_policy_checkpoint(
     checkpoint_label: str | None = None,
 ) -> dict[str, float | str]:
     checkpoint_name = checkpoint_label or str(checkpoint_path.name)
+    eval_mode = "CLEAN" if mode == "REWARD_NOISE" else mode
     policy = PolicyNet(config.obs_size, config.action_size, config.hidden_size).to(device)
     policy.load_state_dict(torch.load(checkpoint_path, map_location=device))
     policy.eval()
@@ -30,7 +31,7 @@ def evaluate_policy_checkpoint(
 
     for eval_seed in config.eval_seeds:
         env = LunarLanderDiagnosticEnv(
-            mode=mode,
+            mode=eval_mode,
             seed=eval_seed,
             env_id=config.env_id,
             reward_noise_p=config.reward_noise_p,
@@ -68,6 +69,7 @@ def evaluate_policy_checkpoint(
     return {
         "checkpoint": checkpoint_name,
         "checkpoint_path": str(checkpoint_path),
+        "eval_mode": eval_mode,
         "eval_return_mean": sum(returns) / max(1, len(returns)),
         "eval_success_mean": sum(successes) / max(1, len(successes)),
         "eval_length_mean": sum(lengths) / max(1, len(lengths)),

@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from src.config import MODES, TrainConfig
+from src.config import MODES, REWARD_MODES, TrainConfig
 from src.trainer_ac import ACPPOTrainer
 
 
@@ -14,6 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train AC_LITE or AC_FULL PPO on LunarLander-v2.")
     parser.add_argument("--method", choices=("AC_LITE", "AC_FULL"), default="AC_LITE")
     parser.add_argument("--mode", choices=MODES, default="CLEAN")
+    parser.add_argument("--reward-mode", choices=REWARD_MODES, default=TrainConfig().reward_mode)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--total-steps", type=int, default=TrainConfig().total_steps)
     parser.add_argument("--policy-lr", type=float, default=TrainConfig().policy_lr)
@@ -36,6 +37,7 @@ def main() -> None:
     args = parse_args()
     config = TrainConfig(
         total_steps=args.total_steps,
+        reward_mode=args.reward_mode,
         policy_lr=args.policy_lr,
         certainty_lr=args.certainty_lr,
         grouped_rollouts=args.grouped_rollouts,
