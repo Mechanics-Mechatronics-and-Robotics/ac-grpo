@@ -17,9 +17,17 @@ def evaluate_policy_checkpoint(
     device: torch.device,
     output_path: Path,
     checkpoint_label: str | None = None,
+    eval_name: str = "selection",
+    eval_mode_override: str | None = None,
+    eval_obs_noise_sigma: float | None = None,
+    eval_seeds_override: tuple[int, ...] | None = None,
+    eval_episodes_override: int | None = None,
 ) -> dict[str, float | str]:
     checkpoint_name = checkpoint_label or str(checkpoint_path.name)
-    eval_mode = "CLEAN" if mode == "REWARD_NOISE" else mode
+    eval_mode = eval_mode_override or mode
+    obs_noise_sigma = config.obs_noise_sigma if eval_obs_noise_sigma is None else eval_obs_noise_sigma
+    eval_seeds = config.eval_seeds if eval_seeds_override is None else eval_seeds_override
+    eval_episodes_per_seed = config.eval_episodes_per_seed if eval_episodes_override is None else eval_episodes_override
     policy = PolicyNet(config.obs_size, config.action_size, config.hidden_size).to(device)
     policy.load_state_dict(torch.load(checkpoint_path, map_location=device))
     policy.eval()
@@ -29,15 +37,15 @@ def evaluate_policy_checkpoint(
     successes: list[float] = []
     lengths: list[int] = []
 
-    for eval_seed in config.eval_seeds:
+    for eval_seed in eval_seeds:
         env = LunarLanderDiagnosticEnv(
             mode=eval_mode,
             seed=eval_seed,
             env_id=config.env_id,
             reward_noise_p=config.reward_noise_p,
-            obs_noise_sigma=config.obs_noise_sigma,
+            obs_noise_sigma=obs_noise_sigma,
         )
-        for episode_idx in range(config.eval_episodes_per_seed):
+        for episode_idx in range(eval_episodes_per_seed):
             obs, _ = env.reset(seed=eval_seed + episode_idx)
             done = False
             episode_return = 0.0
@@ -52,7 +60,7 @@ def evaluate_policy_checkpoint(
                 episode_return += float(reward)
                 episode_length += 1
             success = float(bool(info and info.get("is_success", False)) or episode_return >= 200.0)
-            rows.append([checkpoint_name, eval_seed, episode_idx, episode_return, success, episode_length])
+            rows.append([eval_name, eval_mode, obs_noise_sigma, checkpoint_name, eval_seed, episode_idx, episode_return, success, episode_length])
             returns.append(episode_return)
             successes.append(success)
             lengths.append(episode_length)
@@ -63,13 +71,15 @@ def evaluate_policy_checkpoint(
     with output_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if write_header:
-            writer.writerow(["checkpoint", "eval_seed", "episode", "return", "success", "episode_length"])
+            writer.writerow(["eval_name", "eval_mode", "eval_obs_noise_sigma", "checkpoint", "eval_seed", "episode", "return", "success", "episode_length"])
         writer.writerows(rows)
 
     return {
+        "eval_name": eval_name,
         "checkpoint": checkpoint_name,
         "checkpoint_path": str(checkpoint_path),
         "eval_mode": eval_mode,
+        "eval_obs_noise_sigma": obs_noise_sigma,
         "eval_return_mean": sum(returns) / max(1, len(returns)),
         "eval_success_mean": sum(successes) / max(1, len(successes)),
         "eval_length_mean": sum(lengths) / max(1, len(lengths)),

@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrained-policy-path", default=TrainConfig().pretrained_policy_path)
     parser.add_argument("--freeze-pretrained-policy", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--run-name", default="BASELINE")
+    parser.add_argument("--run-name", default=None)
     return parser.parse_args()
 
 
@@ -52,7 +52,7 @@ def main() -> None:
         seed=args.seed,
         config=config,
         output_dir=args.output_dir,
-        run_name=args.run_name,
+        run_name=args.run_name or f"BASELINE_{args.reward_mode}",
     ).train()
     print(summary)
 

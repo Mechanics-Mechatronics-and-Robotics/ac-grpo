@@ -56,7 +56,7 @@ def main() -> None:
         seed=args.seed,
         config=config,
         output_dir=args.output_dir,
-        run_name=args.run_name,
+        run_name=args.run_name or f"{args.method}_{args.reward_mode}",
     ).train()
     print(summary)
 

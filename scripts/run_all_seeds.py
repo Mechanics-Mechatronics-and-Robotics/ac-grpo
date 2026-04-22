@@ -60,6 +60,8 @@ def build_seed_command(
     freeze_pretrained_policy: bool,
     config_defaults: TrainConfig,
 ) -> list[str]:
+    reward_mode = str(settings.get("reward_mode", config_defaults.reward_mode))
+    run_name = f"{method}_{reward_mode}"
     if method == "BASELINE":
         command = [
             sys.executable,
@@ -67,7 +69,7 @@ def build_seed_command(
             "--mode",
             str(settings["mode"]),
             "--reward-mode",
-            str(settings.get("reward_mode", config_defaults.reward_mode)),
+            reward_mode,
             "--seed",
             str(seed),
             "--total-steps",
@@ -85,7 +87,7 @@ def build_seed_command(
             "--output-dir",
             str(run_dir),
             "--run-name",
-            "BASELINE",
+            run_name,
         ]
         if pretrained_policy_path:
             command.extend(["--pretrained-policy-path", pretrained_policy_path])
@@ -104,7 +106,7 @@ def build_seed_command(
         "--mode",
         str(settings["mode"]),
         "--reward-mode",
-        str(settings.get("reward_mode", config_defaults.reward_mode)),
+        reward_mode,
         "--seed",
         str(seed),
         "--total-steps",
@@ -126,7 +128,7 @@ def build_seed_command(
         "--output-dir",
         str(run_dir),
         "--run-name",
-        method,
+        run_name,
     ]
     if settings["grouped_rollouts"]:
         command.append("--grouped-rollouts")

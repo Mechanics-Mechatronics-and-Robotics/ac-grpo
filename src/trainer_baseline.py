@@ -117,12 +117,14 @@ class PPOBaselineTrainer:
         saved_checkpoints.append(final_checkpoint)
         eval_rows = self._evaluate_checkpoints(saved_checkpoints)
         best_eval = max(eval_rows, key=lambda row: float(row["eval_return_mean"])) if eval_rows else {}
+        challenge_rows = self._evaluate_challenge_suite(best_eval)
         summary = {
             "method": "BASELINE",
             "mode": self.mode,
             "seed": self.seed,
             "total_steps": global_step,
             "best_checkpoint_by_eval_return": best_eval,
+            "challenge_evaluations": challenge_rows,
         }
         summary_with_config = {
             **summary,
@@ -174,7 +176,21 @@ class PPOBaselineTrainer:
                     episode_train_return += rewards[-1]
                 else:
                     episode_train_return += rewards[-1] - float(reward)
-                episode_rows.append([global_step, episode_id, episode_return, episode_train_return, outcome.logged_success, outcome.raw_success, episode_length])
+                episode_rows.append(
+                    [
+                        global_step,
+                        episode_id,
+                        episode_return,
+                        episode_train_return,
+                        outcome.logged_success,
+                        outcome.raw_success,
+                        episode_length,
+                        "",
+                        "",
+                        "",
+                        "",
+                    ]
+                )
                 obs, _ = self.env.reset()
                 episode_return = 0.0
                 episode_train_return = 0.0
@@ -295,7 +311,21 @@ class PPOBaselineTrainer:
                 for idx in range(episode_start, len(group_steps)):
                     group_steps[idx]["episode_success"] = float(outcome.logged_success)
                 group_successes.append(outcome.logged_success)
-                episode_rows.append([global_step, episode_id, episode_return, episode_train_return, outcome.logged_success, outcome.raw_success, episode_length])
+                episode_rows.append(
+                    [
+                        global_step,
+                        episode_id,
+                        episode_return,
+                        episode_train_return,
+                        outcome.logged_success,
+                        outcome.raw_success,
+                        episode_length,
+                        "",
+                        "",
+                        "",
+                        "",
+                    ]
+                )
                 obs, _ = self.env.reset()
                 episode_return = 0.0
                 episode_train_return = 0.0
@@ -415,7 +445,21 @@ class PPOBaselineTrainer:
 
     def _init_logs(self) -> None:
         with self.episode_log.open("w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["step", "episode_id", "return_env", "return_train", "outcome_policy", "outcome_raw", "episode_length"])
+            csv.writer(f).writerow(
+                [
+                    "step",
+                    "episode_id",
+                    "return_env",
+                    "return_train",
+                    "outcome_policy",
+                    "outcome_raw",
+                    "episode_length",
+                    "mean_certainty",
+                    "certainty_delta_corr",
+                    "certainty_action_prob_corr",
+                    "certainty_runner_up_prob_corr",
+                ]
+            )
         with self.step_log.open("w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(["step", "episode_id", "timestep", "entropy", "delta", "certainty"])
         with self.update_log.open("w", newline="", encoding="utf-8") as f:
@@ -510,8 +554,47 @@ class PPOBaselineTrainer:
                     self.device,
                     eval_path,
                     checkpoint_label="checkpoint_0_pretrained",
+                    eval_name="selection",
                 )
             )
         for path in checkpoints:
-            eval_rows.append(evaluate_policy_checkpoint(path, self.mode, self.config, self.device, eval_path))
+            eval_rows.append(evaluate_policy_checkpoint(path, self.mode, self.config, self.device, eval_path, eval_name="selection"))
         return eval_rows
+
+    def _evaluate_challenge_suite(self, best_eval: dict[str, object]) -> list[dict[str, object]]:
+        eval_path = self.log_dir / f"{self.run_id}_checkpoint_eval.csv"
+        rows: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+        checkpoint_specs: list[tuple[str, Path]] = []
+        if self.config.pretrained_policy_path:
+            checkpoint_specs.append(("checkpoint_0_pretrained", Path(self.config.pretrained_policy_path)))
+        if best_eval.get("checkpoint_path"):
+            checkpoint_specs.append((str(best_eval.get("checkpoint")), Path(str(best_eval["checkpoint_path"]))))
+        test_conditions = [("test_clean", "CLEAN", self.config.obs_noise_sigma)]
+        levels = tuple(float(v) for v in self.config.test_eval_obs_noise_levels)
+        if levels:
+            test_conditions.append(("test_obs_noise", "OBS_NOISE", levels[0]))
+        if len(levels) > 1:
+            test_conditions.append(("test_obs_noise_hard", "OBS_NOISE", levels[1]))
+        for checkpoint_label, checkpoint_path in checkpoint_specs:
+            for eval_name, eval_mode, sigma in test_conditions:
+                key = (checkpoint_label, eval_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(
+                    evaluate_policy_checkpoint(
+                        checkpoint_path,
+                        self.mode,
+                        self.config,
+                        self.device,
+                        eval_path,
+                        checkpoint_label=checkpoint_label,
+                        eval_name=eval_name,
+                        eval_mode_override=eval_mode,
+                        eval_obs_noise_sigma=sigma,
+                        eval_seeds_override=self.config.test_eval_seeds,
+                        eval_episodes_override=self.config.test_eval_episodes_per_seed,
+                    )
+                )
+        return rows

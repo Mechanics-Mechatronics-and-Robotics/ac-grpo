@@ -235,7 +235,7 @@ Do not redesign the project.
 Produce one reproducible experiment grid with:
 
 * one common pretrained anchor
-* 9 branches
+* 15 branches
 * 5 seeds
 * sparse reward for all compared methods
 * checkpoint-wise greedy evaluation

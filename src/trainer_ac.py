@@ -23,6 +23,33 @@ from src.trainer_baseline import SPARSE_REWARD_SEMANTICS, set_seed
 
 class ACPPOTrainer:
     @staticmethod
+    def _nan_corr(xs: list[float], ys: list[float]) -> float:
+        if len(xs) < 2 or len(xs) != len(ys):
+            return math.nan
+        x = np.asarray(xs, dtype=np.float64)
+        y = np.asarray(ys, dtype=np.float64)
+        if np.std(x) <= 1e-12 or np.std(y) <= 1e-12:
+            return math.nan
+        return float(np.corrcoef(x, y)[0, 1])
+
+    @classmethod
+    def _episode_certainty_summary(
+        cls,
+        certainties: list[float],
+        deltas: list[float],
+        action_probs: list[float],
+        runner_up_probs: list[float],
+    ) -> tuple[float, float, float, float]:
+        if not certainties:
+            return math.nan, math.nan, math.nan, math.nan
+        return (
+            float(np.mean(certainties)),
+            cls._nan_corr(certainties, deltas),
+            cls._nan_corr(certainties, action_probs),
+            cls._nan_corr(certainties, runner_up_probs),
+        )
+
+    @staticmethod
     def _runner_up_margin(action_probs: torch.Tensor, runner_up_probs: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         denom = (action_probs + runner_up_probs).clamp_min(eps)
         return ((action_probs + 0.5 * eps) / (denom + eps)).clamp(eps, 1.0 - eps)
@@ -111,12 +138,14 @@ class ACPPOTrainer:
         saved_policy_checkpoints.append(final_policy_checkpoint)
         eval_rows = self._evaluate_checkpoints(saved_policy_checkpoints)
         best_eval = max(eval_rows, key=lambda row: float(row["eval_return_mean"])) if eval_rows else {}
+        challenge_rows = self._evaluate_challenge_suite(best_eval)
         summary = {
             "method": self.method,
             "mode": self.mode,
             "seed": self.seed,
             "total_steps": global_step,
             "best_checkpoint_by_eval_return": best_eval,
+            "challenge_evaluations": challenge_rows,
         }
         summary_with_config = {
             **summary,
@@ -143,6 +172,10 @@ class ACPPOTrainer:
         episode_rows, step_rows = [], []
         current_episode_start = 0
         episode_train_return = 0.0
+        current_episode_certainties: list[float] = []
+        current_episode_deltas: list[float] = []
+        current_episode_action_probs: list[float] = []
+        current_episode_runner_up_probs: list[float] = []
         for _ in range(cfg.steps_per_update):
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             with torch.no_grad():
@@ -172,6 +205,10 @@ class ACPPOTrainer:
             outcome_masks.append(0.0)
             terminal_masks.append(0.0)
             step_rows.append([global_step, episode_id, episode_length, entropy.item(), action_prob.item(), runner_prob.item(), delta.item(), certainty.item(), old_mixture_prob.item()])
+            current_episode_certainties.append(float(certainty.item()))
+            current_episode_deltas.append(float(delta.item()))
+            current_episode_action_probs.append(float(action_prob.item()))
+            current_episode_runner_up_probs.append(float(runner_prob.item()))
             episode_train_return += rewards[-1]
             episode_return += float(reward)
             episode_length += 1
@@ -189,12 +226,36 @@ class ACPPOTrainer:
                     outcome_masks[idx] = 1.0
                 terminal_masks[-1] = 1.0
                 current_episode_start = len(successes)
-                episode_rows.append([global_step, episode_id, episode_return, episode_train_return, outcome.logged_success, outcome.raw_success, episode_length])
+                mean_certainty, corr_delta, corr_action, corr_runner = self._episode_certainty_summary(
+                    current_episode_certainties,
+                    current_episode_deltas,
+                    current_episode_action_probs,
+                    current_episode_runner_up_probs,
+                )
+                episode_rows.append(
+                    [
+                        global_step,
+                        episode_id,
+                        episode_return,
+                        episode_train_return,
+                        outcome.logged_success,
+                        outcome.raw_success,
+                        episode_length,
+                        mean_certainty,
+                        corr_delta,
+                        corr_action,
+                        corr_runner,
+                    ]
+                )
                 obs, _ = self.env.reset()
                 episode_return = 0.0
                 episode_train_return = 0.0
                 episode_length = 0
                 episode_id += 1
+                current_episode_certainties = []
+                current_episode_deltas = []
+                current_episode_action_probs = []
+                current_episode_runner_up_probs = []
         self._append_rows(self.step_log, step_rows)
         self._append_rows(self.episode_log, episode_rows)
         with torch.no_grad():
@@ -240,6 +301,10 @@ class ACPPOTrainer:
         group_success_counts: list[float] = []
         target_steps = min(cfg.steps_per_update, cfg.total_steps - global_step)
         episode_train_return = 0.0
+        current_episode_certainties: list[float] = []
+        current_episode_deltas: list[float] = []
+        current_episode_action_probs: list[float] = []
+        current_episode_runner_up_probs: list[float] = []
         while global_step < cfg.total_steps and len(all_step_rows) < target_steps:
             group_steps: list[dict[str, float | int | np.ndarray]] = []
             group_successes: list[int] = []
@@ -280,6 +345,10 @@ class ACPPOTrainer:
                         }
                     )
                     all_step_rows.append([global_step, episode_id, episode_length, entropy.item(), action_prob.item(), runner_prob.item(), delta.item(), certainty.item(), old_mixture_prob.item()])
+                    current_episode_certainties.append(float(certainty.item()))
+                    current_episode_deltas.append(float(delta.item()))
+                    current_episode_action_probs.append(float(action_prob.item()))
+                    current_episode_runner_up_probs.append(float(runner_prob.item()))
                     episode_train_return += train_reward
                     episode_return += float(reward)
                     episode_length += 1
@@ -296,12 +365,36 @@ class ACPPOTrainer:
                     group_steps[idx]["outcome_mask"] = 1.0
                 group_steps[-1]["terminal_mask"] = 1.0
                 group_successes.append(outcome.logged_success)
-                episode_rows.append([global_step, episode_id, episode_return, episode_train_return, outcome.logged_success, outcome.raw_success, episode_length])
+                mean_certainty, corr_delta, corr_action, corr_runner = self._episode_certainty_summary(
+                    current_episode_certainties,
+                    current_episode_deltas,
+                    current_episode_action_probs,
+                    current_episode_runner_up_probs,
+                )
+                episode_rows.append(
+                    [
+                        global_step,
+                        episode_id,
+                        episode_return,
+                        episode_train_return,
+                        outcome.logged_success,
+                        outcome.raw_success,
+                        episode_length,
+                        mean_certainty,
+                        corr_delta,
+                        corr_action,
+                        corr_runner,
+                    ]
+                )
                 obs, _ = self.env.reset()
                 episode_return = 0.0
                 episode_train_return = 0.0
                 episode_length = 0
                 episode_id += 1
+                current_episode_certainties = []
+                current_episode_deltas = []
+                current_episode_action_probs = []
+                current_episode_runner_up_probs = []
             group_total += 1
             success_count = sum(group_successes)
             group_success_counts.append(float(success_count))
@@ -492,7 +585,21 @@ class ACPPOTrainer:
 
     def _init_logs(self) -> None:
         with self.episode_log.open("w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["step", "episode_id", "return_env", "return_train", "outcome_policy", "outcome_raw", "episode_length"])
+            csv.writer(f).writerow(
+                [
+                    "step",
+                    "episode_id",
+                    "return_env",
+                    "return_train",
+                    "outcome_policy",
+                    "outcome_raw",
+                    "episode_length",
+                    "mean_certainty",
+                    "certainty_delta_corr",
+                    "certainty_action_prob_corr",
+                    "certainty_runner_up_prob_corr",
+                ]
+            )
         with self.step_log.open("w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(["step", "episode_id", "timestep", "entropy", "action_prob", "runner_up_prob", "delta", "certainty", "mixture_prob"])
         with self.update_log.open("w", newline="", encoding="utf-8") as f:
@@ -610,8 +717,47 @@ class ACPPOTrainer:
                     self.device,
                     eval_path,
                     checkpoint_label="checkpoint_0_pretrained",
+                    eval_name="selection",
                 )
             )
         for path in checkpoints:
-            eval_rows.append(evaluate_policy_checkpoint(path, self.mode, self.config, self.device, eval_path))
+            eval_rows.append(evaluate_policy_checkpoint(path, self.mode, self.config, self.device, eval_path, eval_name="selection"))
         return eval_rows
+
+    def _evaluate_challenge_suite(self, best_eval: dict[str, object]) -> list[dict[str, object]]:
+        eval_path = self.log_dir / f"{self.run_id}_checkpoint_eval.csv"
+        rows: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+        checkpoint_specs: list[tuple[str, Path]] = []
+        if self.config.pretrained_policy_path:
+            checkpoint_specs.append(("checkpoint_0_pretrained", Path(self.config.pretrained_policy_path)))
+        if best_eval.get("checkpoint_path"):
+            checkpoint_specs.append((str(best_eval.get("checkpoint")), Path(str(best_eval["checkpoint_path"]))))
+        test_conditions = [("test_clean", "CLEAN", self.config.obs_noise_sigma)]
+        levels = tuple(float(v) for v in self.config.test_eval_obs_noise_levels)
+        if levels:
+            test_conditions.append(("test_obs_noise", "OBS_NOISE", levels[0]))
+        if len(levels) > 1:
+            test_conditions.append(("test_obs_noise_hard", "OBS_NOISE", levels[1]))
+        for checkpoint_label, checkpoint_path in checkpoint_specs:
+            for eval_name, eval_mode, sigma in test_conditions:
+                key = (checkpoint_label, eval_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(
+                    evaluate_policy_checkpoint(
+                        checkpoint_path,
+                        self.mode,
+                        self.config,
+                        self.device,
+                        eval_path,
+                        checkpoint_label=checkpoint_label,
+                        eval_name=eval_name,
+                        eval_mode_override=eval_mode,
+                        eval_obs_noise_sigma=sigma,
+                        eval_seeds_override=self.config.test_eval_seeds,
+                        eval_episodes_override=self.config.test_eval_episodes_per_seed,
+                    )
+                )
+        return rows

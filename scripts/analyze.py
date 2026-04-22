@@ -16,9 +16,11 @@ from src.metrics import safe_auroc
 
 
 METHOD_COLORS = {
-    "BASELINE": "red",
-    "AC_LITE": "green",
-    "AC_FULL": "blue",
+    "BASELINE_SPARSE": "#c0392b",
+    "BASELINE_DENSE": "#e67e22",
+    "AC_LITE_SPARSE": "#2e8b57",
+    "AC_LITE_DENSE": "#16a085",
+    "AC_FULL_SPARSE": "#1f77b4",
 }
 
 MODE_LINESTYLES = {
@@ -27,59 +29,113 @@ MODE_LINESTYLES = {
     "OBS_NOISE": "--",
 }
 
+METHOD_ORDER = (
+    "BASELINE_SPARSE",
+    "BASELINE_DENSE",
+    "AC_LITE_SPARSE",
+    "AC_LITE_DENSE",
+    "AC_FULL_SPARSE",
+)
+
+MODE_ORDER = ("CLEAN", "OBS_NOISE", "REWARD_NOISE")
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate exactly the required AC-GRPO diagnostic plots.")
+    parser = argparse.ArgumentParser(description="Generate AC-PPO diagnostic plots and report.")
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
     parser.add_argument("--plot-dir", type=Path, default=PLOT_DIR)
     return parser.parse_args()
 
 
-def parse_run_name(path: Path) -> tuple[str, str, int]:
-    # Python 3.7 compatibility: str.removesuffix was added in Python 3.9
+def _split_method_reward(core: str) -> tuple[str, str]:
+    for reward_mode in ("SPARSE", "DENSE"):
+        suffix = f"_{reward_mode}"
+        if core.endswith(suffix):
+            return core[: -len(suffix)], reward_mode
+    return core, "SPARSE"
+
+
+def parse_run_name(path: Path) -> tuple[str, str, str, int, str]:
     stem = path.stem
-    for suffix in ("_checkpoint_eval", "_episodes", "_steps"):
+    for suffix in ("_checkpoint_eval", "_episodes", "_steps", "_updates", "_summary"):
         if stem.endswith(suffix):
             stem = stem[: -len(suffix)]
     prefix, seed_part = stem.rsplit("_seed", 1)
     seed = int(seed_part)
     for mode in ("REWARD_NOISE", "OBS_NOISE", "CLEAN"):
-        suffix = f"_{mode}"
-        if prefix.endswith(suffix):
-            return prefix[: -len(suffix)], mode, seed
+        mode_suffix = f"_{mode}"
+        if prefix.endswith(mode_suffix):
+            core = prefix[: -len(mode_suffix)]
+            method_family, reward_mode = _split_method_reward(core)
+            method_label = f"{method_family}_{reward_mode}"
+            return method_family, reward_mode, mode, seed, method_label
     raise ValueError(f"Could not parse run name: {path.name}")
 
 
-def load_logs(log_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _coerce_episode_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if "return_env" in df.columns and "return" not in df.columns:
+        df["return"] = pd.to_numeric(df["return_env"], errors="coerce")
+    if "outcome_policy" in df.columns and "success" not in df.columns:
+        df["success"] = pd.to_numeric(df["outcome_policy"], errors="coerce")
+    if "outcome_raw" in df.columns and "raw_success" not in df.columns:
+        df["raw_success"] = pd.to_numeric(df["outcome_raw"], errors="coerce")
+    return df
+
+
+def load_logs(log_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     episode_frames = []
-    for path in log_dir.rglob("*_episodes.csv"):
-        df = pd.read_csv(path)
-        if "return_env" in df.columns and "return" not in df.columns:
-            df["return"] = pd.to_numeric(df["return_env"], errors="coerce")
-        if "outcome_policy" in df.columns and "success" not in df.columns:
-            df["success"] = pd.to_numeric(df["outcome_policy"], errors="coerce")
-        if "outcome_raw" in df.columns and "raw_success" not in df.columns:
-            df["raw_success"] = pd.to_numeric(df["outcome_raw"], errors="coerce")
-        method, mode, seed = parse_run_name(path)
-        df["method"], df["mode"], df["seed"] = method, mode, seed
-        episode_frames.append(df)
     step_frames = []
+    update_frames = []
+    for path in log_dir.rglob("*_episodes.csv"):
+        df = _coerce_episode_columns(pd.read_csv(path))
+        method_family, reward_mode, mode, seed, method_label = parse_run_name(path)
+        df["method_family"] = method_family
+        df["reward_mode"] = reward_mode
+        df["method"] = method_label
+        df["mode"] = mode
+        df["seed"] = seed
+        episode_frames.append(df)
     for path in log_dir.rglob("*_steps.csv"):
         df = pd.read_csv(path)
-        method, mode, seed = parse_run_name(path)
-        df["method"], df["mode"], df["seed"] = method, mode, seed
+        method_family, reward_mode, mode, seed, method_label = parse_run_name(path)
+        df["method_family"] = method_family
+        df["reward_mode"] = reward_mode
+        df["method"] = method_label
+        df["mode"] = mode
+        df["seed"] = seed
         step_frames.append(df)
+    for path in log_dir.rglob("*_updates.csv"):
+        df = pd.read_csv(path)
+        method_family, reward_mode, mode, seed, method_label = parse_run_name(path)
+        df["method_family"] = method_family
+        df["reward_mode"] = reward_mode
+        df["method"] = method_label
+        df["mode"] = mode
+        df["seed"] = seed
+        update_frames.append(df)
     episodes = pd.concat(episode_frames, ignore_index=True) if episode_frames else pd.DataFrame()
     steps = pd.concat(step_frames, ignore_index=True) if step_frames else pd.DataFrame()
-    return episodes, steps
+    updates = pd.concat(update_frames, ignore_index=True) if update_frames else pd.DataFrame()
+    return episodes, steps, updates
 
 
 def load_eval_logs(log_dir: Path) -> pd.DataFrame:
     frames = []
     for path in log_dir.rglob("*_checkpoint_eval.csv"):
         df = pd.read_csv(path)
-        method, mode, seed = parse_run_name(path)
-        df["method"], df["mode"], df["seed"] = method, mode, seed
+        if "eval_name" not in df.columns:
+            df["eval_name"] = "selection"
+        if "eval_mode" not in df.columns:
+            _, _, mode, _, _ = parse_run_name(path)
+            df["eval_mode"] = mode
+        if "eval_obs_noise_sigma" not in df.columns:
+            df["eval_obs_noise_sigma"] = np.nan
+        method_family, reward_mode, mode, seed, method_label = parse_run_name(path)
+        df["method_family"] = method_family
+        df["reward_mode"] = reward_mode
+        df["method"] = method_label
+        df["mode"] = mode
+        df["seed"] = seed
         frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
@@ -94,28 +150,17 @@ def _seed_mean_curve(
     window: int = 20,
     grid_points: int = 250,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Mean±std curve over seeds for a given y_col.
-
-    IMPORTANT: 'step' starts at 0 for every seed/run, so we must compute curves per
-    seed and then aggregate; sorting by 'step' after concatenation will interleave
-    seeds and produce misleading plots.
-    """
     if episodes.empty:
         return np.array([]), np.array([]), np.array([])
-
-    # Common x grid in [0, max_step]
     max_step = float(pd.to_numeric(episodes["step"], errors="coerce").max())
     if not np.isfinite(max_step) or max_step <= 0:
         return np.array([]), np.array([]), np.array([])
     grid = np.linspace(0.0, max_step, grid_points)
-
     seed_series = []
     for seed in sorted(episodes["seed"].unique().tolist()):
         g = episodes[episodes["seed"] == seed].sort_values("step")
         x = pd.to_numeric(g["step"], errors="coerce").to_numpy(dtype=float)
-        y = pd.to_numeric(g[y_col], errors="coerce")
-        y = rolling_mean(y, window=window).to_numpy(dtype=float)
+        y = rolling_mean(pd.to_numeric(g[y_col], errors="coerce"), window=window).to_numpy(dtype=float)
         mask = np.isfinite(x) & np.isfinite(y)
         x = x[mask]
         y = y[mask]
@@ -124,49 +169,56 @@ def _seed_mean_curve(
         order = np.argsort(x)
         x = x[order]
         y = y[order]
-        # Ensure unique x for interpolation
         x_unique, idx = np.unique(x, return_index=True)
         y_unique = y[idx]
         if len(x_unique) < 2:
             continue
         seed_series.append(np.interp(grid, x_unique, y_unique))
-
     if not seed_series:
         return np.array([]), np.array([]), np.array([])
     mat = np.vstack(seed_series)
-    mean = mat.mean(axis=0)
-    std = mat.std(axis=0, ddof=0)
-    return grid, mean, std
+    return grid, mat.mean(axis=0), mat.std(axis=0, ddof=0)
 
 
 def _format_mean_std(mean: float, std: float, digits: int = 1) -> str:
+    if math.isfinite(mean) and not math.isfinite(std):
+        std = 0.0
     if not (math.isfinite(mean) and math.isfinite(std)):
         return "n/a"
     fmt = f"{{:.{digits}f}}"
     return f"{fmt.format(mean)} ± {fmt.format(std)}"
 
 
-def _method_color(method: str) -> str | None:
-    return METHOD_COLORS.get(method)
-
-
-def _mode_linestyle(mode: str) -> str:
-    return MODE_LINESTYLES.get(mode, "-")
+def _ordered_groups(df: pd.DataFrame, group_cols: list[str]) -> list[tuple[tuple[object, ...], pd.DataFrame]]:
+    groups = []
+    for key, group in df.groupby(group_cols):
+        groups.append((key if isinstance(key, tuple) else (key,), group))
+    method_idx = {name: idx for idx, name in enumerate(METHOD_ORDER)}
+    mode_idx = {name: idx for idx, name in enumerate(MODE_ORDER)}
+    def sort_key(item: tuple[tuple[object, ...], pd.DataFrame]) -> tuple[int, int]:
+        key = item[0]
+        if len(key) == 2:
+            method, mode = key
+        else:
+            method = key[0]
+            mode = "CLEAN"
+        return method_idx.get(str(method), 999), mode_idx.get(str(mode), 999)
+    return sorted(groups, key=sort_key)
 
 
 def save_return_vs_steps(episodes: pd.DataFrame, plot_dir: Path) -> None:
     plt.figure(figsize=(10, 6))
-    for (method, mode), group in episodes.groupby(["method", "mode"]):
+    for (method, mode), group in _ordered_groups(episodes, ["method", "mode"]):
         x, mean, std = _seed_mean_curve(group, "return", window=20, grid_points=250)
         if len(x) == 0:
             continue
-        label = f"{method} {mode}"
-        color = _method_color(method)
-        plt.plot(x, mean, label=label, color=color, linestyle=_mode_linestyle(mode))
+        color = METHOD_COLORS.get(str(method))
+        plt.plot(x, mean, label=f"{method} {mode}", color=color, linestyle=MODE_LINESTYLES.get(str(mode), "-"))
         plt.fill_between(x, mean - std, mean + std, color=color, alpha=0.15)
     plt.xlabel("steps")
     plt.ylabel("return")
     plt.title("Return vs steps")
+    plt.grid(alpha=0.25)
     handles, labels = plt.gca().get_legend_handles_labels()
     if handles:
         plt.legend(fontsize=8)
@@ -177,17 +229,17 @@ def save_return_vs_steps(episodes: pd.DataFrame, plot_dir: Path) -> None:
 
 def save_success_vs_steps(episodes: pd.DataFrame, plot_dir: Path) -> None:
     plt.figure(figsize=(10, 6))
-    for (method, mode), group in episodes.groupby(["method", "mode"]):
+    for (method, mode), group in _ordered_groups(episodes, ["method", "mode"]):
         x, mean, std = _seed_mean_curve(group, "success", window=20, grid_points=250)
         if len(x) == 0:
             continue
-        label = f"{method} {mode}"
-        color = _method_color(method)
-        plt.plot(x, mean, label=label, color=color, linestyle=_mode_linestyle(mode))
+        color = METHOD_COLORS.get(str(method))
+        plt.plot(x, mean, label=f"{method} {mode}", color=color, linestyle=MODE_LINESTYLES.get(str(mode), "-"))
         plt.fill_between(x, np.clip(mean - std, 0.0, 1.0), np.clip(mean + std, 0.0, 1.0), color=color, alpha=0.15)
     plt.xlabel("steps")
     plt.ylabel("success rate")
     plt.title("Success rate vs steps")
+    plt.grid(alpha=0.25)
     handles, labels = plt.gca().get_legend_handles_labels()
     if handles:
         plt.legend(fontsize=8)
@@ -196,33 +248,31 @@ def save_success_vs_steps(episodes: pd.DataFrame, plot_dir: Path) -> None:
     plt.close()
 
 
-def save_metric_by_mode_subplots(episodes: pd.DataFrame, y_col: str, ylabel: str, title: str, filename: str, plot_dir: Path) -> None:
-    modes = ("CLEAN", "OBS_NOISE", "REWARD_NOISE")
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
-    for ax, mode in zip(axes, modes):
+def save_metric_by_mode_subplots(
+    episodes: pd.DataFrame,
+    y_col: str,
+    ylabel: str,
+    title: str,
+    filename: str,
+    plot_dir: Path,
+) -> None:
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=False)
+    for ax, mode in zip(axes, MODE_ORDER):
         mode_df = episodes[episodes["mode"] == mode]
-        for method, group in mode_df.groupby("method"):
+        for (method,), group in _ordered_groups(mode_df, ["method"]):
             x, mean, std = _seed_mean_curve(group, y_col, window=20, grid_points=250)
             if len(x) == 0:
                 continue
-            color = _method_color(method)
-            ax.plot(x, mean, label=method, color=color)
-            if y_col == "success":
-                lower = np.clip(mean - std, 0.0, 1.0)
-                upper = np.clip(mean + std, 0.0, 1.0)
-            else:
-                lower = mean - std
-                upper = mean + std
+            color = METHOD_COLORS.get(str(method))
+            ax.plot(x, mean, label=str(method), color=color)
+            lower = np.clip(mean - std, 0.0, 1.0) if y_col == "success" else mean - std
+            upper = np.clip(mean + std, 0.0, 1.0) if y_col == "success" else mean + std
             ax.fill_between(x, lower, upper, color=color, alpha=0.15)
         ax.set_title(mode)
         ax.set_xlabel("steps")
         ax.grid(alpha=0.25)
     axes[0].set_ylabel(ylabel)
-    handles, labels = [], []
-    for ax in axes:
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            break
+    handles, labels = axes[-1].get_legend_handles_labels()
     if handles:
         axes[-1].legend(handles, labels, fontsize=8)
     fig.suptitle(title)
@@ -231,20 +281,46 @@ def save_metric_by_mode_subplots(episodes: pd.DataFrame, y_col: str, ylabel: str
     plt.close(fig)
 
 
-def save_certainty_histogram(steps: pd.DataFrame, plot_dir: Path) -> None:
-    data = pd.to_numeric(steps["certainty"], errors="coerce").dropna()
+def save_certainty_histogram(episodes: pd.DataFrame, steps: pd.DataFrame, plot_dir: Path) -> None:
+    if steps.empty or "certainty" not in steps.columns:
+        return
+    cert_df = steps.copy()
+    cert_df["certainty"] = pd.to_numeric(cert_df["certainty"], errors="coerce")
+    cert_df = cert_df.merge(
+        episodes[["method", "mode", "seed", "episode_id", "success"]],
+        on=["method", "mode", "seed", "episode_id"],
+        how="left",
+    )
+    cert_df["success"] = pd.to_numeric(cert_df["success"], errors="coerce")
+    cert_df = cert_df.dropna(subset=["certainty", "success"])
+    if cert_df.empty:
+        return
+    bins = np.linspace(0.0, 1.0, 61)
+    success_vals = cert_df[cert_df["success"] >= 0.5]["certainty"].to_numpy(dtype=float)
+    fail_vals = cert_df[cert_df["success"] < 0.5]["certainty"].to_numpy(dtype=float)
     plt.figure(figsize=(8, 6))
-    plt.hist(data, bins=40)
-    plt.xlabel("certainty")
+    if len(success_vals):
+        plt.hist(success_vals, bins=bins, color="blue", alpha=0.55, label="success")
+    if len(fail_vals):
+        plt.hist(fail_vals, bins=bins, color="red", alpha=0.55, label="failure")
+    plt.xlabel("timestep certainty")
     plt.ylabel("count")
-    plt.title("Certainty histogram")
+    plt.title("Timestep certainty histogram")
+    plt.grid(alpha=0.25)
+    handles, labels = plt.gca().get_legend_handles_labels()
+    if handles:
+        plt.legend()
     plt.tight_layout()
     plt.savefig(plot_dir / "03_certainty_histogram.png")
     plt.close()
 
 
 def save_scatter(steps: pd.DataFrame, x: str, y: str, filename: str, title: str, plot_dir: Path) -> None:
+    if x not in steps.columns or y not in steps.columns:
+        return
     df = steps[[x, y]].apply(pd.to_numeric, errors="coerce").dropna()
+    if df.empty:
+        return
     if len(df) > 20_000:
         df = df.sample(20_000, random_state=42)
     plt.figure(figsize=(8, 6))
@@ -252,21 +328,20 @@ def save_scatter(steps: pd.DataFrame, x: str, y: str, filename: str, title: str,
     plt.xlabel(x)
     plt.ylabel(y)
     plt.title(title)
+    plt.grid(alpha=0.25)
     plt.tight_layout()
     plt.savefig(plot_dir / filename)
     plt.close()
 
 
 def _compute_auc_tables(episodes: pd.DataFrame, steps: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if episodes.empty or steps.empty or "certainty" not in steps:
+    if episodes.empty or steps.empty or "certainty" not in steps.columns:
         return pd.DataFrame(), pd.DataFrame()
-
     cert_steps = steps.copy()
     cert_steps["certainty"] = pd.to_numeric(cert_steps["certainty"], errors="coerce")
     cert_steps = cert_steps.dropna(subset=["certainty"])
     if cert_steps.empty:
         return pd.DataFrame(), pd.DataFrame()
-
     means = (
         cert_steps.groupby(["method", "mode", "seed", "episode_id"])["certainty"]
         .mean()
@@ -279,10 +354,12 @@ def _compute_auc_tables(episodes: pd.DataFrame, steps: pd.DataFrame) -> tuple[pd
     )
     if merged.empty:
         return pd.DataFrame(), pd.DataFrame()
-
-    traj_series = merged.groupby(["method", "mode"]).apply(lambda g: safe_auroc(g["success"], g["mean_certainty"]))
-    traj = traj_series.to_frame("trajectory_auroc").reset_index()
-
+    traj = (
+        merged.groupby(["method", "mode"])
+        .apply(lambda g: safe_auroc(g["success"], g["mean_certainty"]))
+        .to_frame("trajectory_auroc")
+        .reset_index()
+    )
     late = cert_steps.merge(
         episodes[["method", "mode", "seed", "episode_id", "episode_length"]],
         on=["method", "mode", "seed", "episode_id"],
@@ -291,23 +368,22 @@ def _compute_auc_tables(episodes: pd.DataFrame, steps: pd.DataFrame) -> tuple[pd
     if late.empty:
         return traj, pd.DataFrame()
     late["late_phase"] = pd.to_numeric(late["timestep"], errors="coerce") > 0.8 * pd.to_numeric(late["episode_length"], errors="coerce")
-
-    step_series = late.groupby(["method", "mode"]).apply(lambda g: safe_auroc(g["late_phase"], 1.0 - g["certainty"]))
-    step = step_series.to_frame("timestep_auroc").reset_index()
+    step = (
+        late.groupby(["method", "mode"])
+        .apply(lambda g: safe_auroc(g["late_phase"], 1.0 - g["certainty"]))
+        .to_frame("timestep_auroc")
+        .reset_index()
+    )
     return traj, step
 
 
 def _compute_episode_tables(episodes: pd.DataFrame, last_n: int = 20) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Per-run (method, mode, seed) summary and aggregated (method, mode) summary.
-    """
     if episodes.empty:
         return pd.DataFrame(), pd.DataFrame()
 
     def per_run(g: pd.DataFrame) -> pd.Series:
         g = g.sort_values("step")
         tail = g.tail(last_n)
-        # best rolling window of size last_n (requires >= last_n episodes)
         if len(g) >= last_n:
             best_ret = float(pd.to_numeric(g["return"], errors="coerce").rolling(last_n, min_periods=last_n).mean().max())
             best_succ = float(pd.to_numeric(g["success"], errors="coerce").rolling(last_n, min_periods=last_n).mean().max())
@@ -326,7 +402,6 @@ def _compute_episode_tables(episodes: pd.DataFrame, last_n: int = 20) -> tuple[p
         )
 
     per_seed = episodes.groupby(["method", "mode", "seed"]).apply(per_run).reset_index()
-
     agg = (
         per_seed.groupby(["method", "mode"])
         .agg(
@@ -341,93 +416,198 @@ def _compute_episode_tables(episodes: pd.DataFrame, last_n: int = 20) -> tuple[p
         )
         .reset_index()
     )
-
     return per_seed, agg
 
 
-def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, report_dir: Path) -> None:
-    # Keep the original summary.md, but make it more informative + reproducible.
-    lines = [
-        "# RL Diagnostic Summary",
+def _compute_certainty_episode_summary(episodes: pd.DataFrame) -> pd.DataFrame:
+    needed = ["mean_certainty", "certainty_delta_corr", "certainty_action_prob_corr", "certainty_runner_up_prob_corr"]
+    if episodes.empty or any(col not in episodes.columns for col in needed):
+        return pd.DataFrame()
+    df = episodes.copy()
+    for col in needed:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["mean_certainty"], how="any")
+    if df.empty:
+        return pd.DataFrame()
+    return (
+        df.groupby(["method", "mode"])
+        .agg(
+            mean_episode_certainty=("mean_certainty", "mean"),
+            certainty_delta_corr_mean=("certainty_delta_corr", "mean"),
+            certainty_action_prob_corr_mean=("certainty_action_prob_corr", "mean"),
+            certainty_runner_up_prob_corr_mean=("certainty_runner_up_prob_corr", "mean"),
+        )
+        .reset_index()
+    )
+
+
+def _selection_best_rows(evals: pd.DataFrame) -> pd.DataFrame:
+    if evals.empty:
+        return pd.DataFrame()
+    selection = evals[evals["eval_name"] == "selection"].copy()
+    if selection.empty:
+        return pd.DataFrame()
+    summary = (
+        selection.groupby(["method", "mode", "seed", "checkpoint", "eval_name", "eval_mode", "eval_obs_noise_sigma"])
+        .agg(eval_return=("return", "mean"), eval_success=("success", "mean"), eval_length=("episode_length", "mean"))
+        .reset_index()
+    )
+    summary["anchor_preference"] = (summary["checkpoint"] == "checkpoint_0_pretrained").astype(int)
+    return (
+        summary.sort_values(["eval_return", "anchor_preference"], ascending=[False, False])
+        .groupby(["method", "mode", "seed"])
+        .head(1)
+        .drop(columns=["anchor_preference"])
+    )
+
+
+def _challenge_summary(evals: pd.DataFrame) -> pd.DataFrame:
+    if evals.empty:
+        return pd.DataFrame()
+    challenge = evals[evals["eval_name"] != "selection"].copy()
+    if challenge.empty:
+        return pd.DataFrame()
+    return (
+        challenge.groupby(["method", "mode", "checkpoint", "eval_name", "eval_mode", "eval_obs_noise_sigma"])
+        .agg(
+            eval_return_mean=("return", "mean"),
+            eval_return_std=("return", "std"),
+            eval_success_mean=("success", "mean"),
+            eval_success_std=("success", "std"),
+            episodes=("episode", "count"),
+        )
+        .reset_index()
+    )
+
+
+def _best_checkpoint_challenge(evals: pd.DataFrame, best_rows: pd.DataFrame) -> pd.DataFrame:
+    if evals.empty or best_rows.empty:
+        return pd.DataFrame()
+    merged = evals.merge(best_rows[["method", "mode", "seed", "checkpoint"]], on=["method", "mode", "seed", "checkpoint"], how="inner")
+    merged = merged[merged["eval_name"] != "selection"]
+    if merged.empty:
+        return pd.DataFrame()
+    return (
+        merged.groupby(["method", "mode", "eval_name", "eval_mode", "eval_obs_noise_sigma"])
+        .agg(
+            eval_return_mean=("return", "mean"),
+            eval_return_std=("return", "std"),
+            eval_success_mean=("success", "mean"),
+            eval_success_std=("success", "std"),
+            episodes=("episode", "count"),
+        )
+        .reset_index()
+    )
+
+
+def _checkpoint0_win_rate(best_rows: pd.DataFrame) -> pd.DataFrame:
+    if best_rows.empty:
+        return pd.DataFrame()
+    df = best_rows.copy()
+    df["anchor_won"] = (df["checkpoint"] == "checkpoint_0_pretrained").astype(float)
+    return (
+        df.groupby(["method", "mode"])
+        .agg(anchor_win_fraction=("anchor_won", "mean"), anchor_win_count=("anchor_won", "sum"), seeds=("seed", "nunique"))
+        .reset_index()
+    )
+
+
+def _lines_from_protocol(episodes: pd.DataFrame, evals: pd.DataFrame) -> list[str]:
+    methods = ", ".join(sorted(episodes["method"].dropna().unique().tolist())) if not episodes.empty else "n/a"
+    modes = ", ".join(sorted(episodes["mode"].dropna().unique().tolist())) if not episodes.empty else "n/a"
+    reward_modes = ", ".join(sorted(episodes["reward_mode"].dropna().unique().tolist())) if not episodes.empty else "n/a"
+    seeds = ", ".join(str(int(v)) for v in sorted(episodes["seed"].dropna().unique().tolist())) if not episodes.empty else "n/a"
+    challenge = evals[evals["eval_name"] != "selection"] if not evals.empty else pd.DataFrame()
+    challenge_episodes = int(challenge.groupby(["eval_name", "eval_seed"]).size().max()) if not challenge.empty else 0
+    return [
+        "## Experiment protocol",
         "",
-        "This summary is generated from CSV logs in the selected output folder.",
+        f"- Implemented method variants in this run: {methods}",
+        f"- Training modes: {modes}",
+        f"- Reward modes represented: {reward_modes}",
+        f"- Training seeds: {seeds}",
+        "- All branches start from the shared pretrained anchor when a pretrained path is provided.",
+        "- Training uses grouped rollouts with dynamic sampling fallback when no mixed-outcome groups are available.",
+        "- Checkpoints are saved during training and the pretrained anchor is treated as checkpoint 0.",
+        "- Checkpoint selection uses greedy held-out evaluation under the branch's primary selection condition.",
+        "- Additional challenge tests evaluate selected checkpoints under CLEAN, OBS_NOISE (typical), and OBS_NOISE (hard).",
+        f"- Challenge tests currently use up to {challenge_episodes} episodes per evaluation seed in the generated logs." if challenge_episodes else "- Challenge-test episodes were not found in the current logs.",
         "",
     ]
 
+
+def _lines_from_auto_analysis(agg: pd.DataFrame, best_rows: pd.DataFrame, best_challenge: pd.DataFrame, certainty_summary: pd.DataFrame) -> list[str]:
+    lines = ["## Result analysis", ""]
+    if not agg.empty:
+        lines.append("The final training-window summary shows the following strongest method per mode:")
+        lines.append("")
+        for mode in MODE_ORDER:
+            mode_df = agg[agg["mode"] == mode]
+            if mode_df.empty:
+                continue
+            top = mode_df.sort_values("final_return_mean", ascending=False).iloc[0]
+            lines.append(
+                f"- {mode}: `{top['method']}` has the highest mean final return ({top['final_return_mean']:.1f}) with mean final success {top['final_success_mean']:.3f}."
+            )
+        lines.append("")
+    if not best_rows.empty:
+        anchor = _checkpoint0_win_rate(best_rows)
+        if not anchor.empty:
+            lines.append("Checkpoint selection versus the pretrained anchor:")
+            lines.append("")
+            for _, row in anchor.sort_values(["mode", "method"]).iterrows():
+                lines.append(
+                    f"- {row['mode']} / {row['method']}: checkpoint 0 wins in {int(row['anchor_win_count'])} of {int(row['seeds'])} seeds ({row['anchor_win_fraction']:.2f})."
+                )
+            lines.append("")
+    if not best_challenge.empty:
+        lines.append("Best-checkpoint challenge testing:")
+        lines.append("")
+        for eval_name in ("test_clean", "test_obs_noise", "test_obs_noise_hard"):
+            eval_df = best_challenge[best_challenge["eval_name"] == eval_name]
+            if eval_df.empty:
+                continue
+            top = eval_df.sort_values("eval_return_mean", ascending=False).iloc[0]
+            sigma = top["eval_obs_noise_sigma"]
+            sigma_text = "" if not math.isfinite(float(sigma)) else f", sigma={float(sigma):.2f}"
+            lines.append(
+                f"- {eval_name} ({top['eval_mode']}{sigma_text}): best mean return is `{top['method']}` in `{top['mode']}` with {top['eval_return_mean']:.1f} ± {top['eval_return_std']:.1f} and success {top['eval_success_mean']:.3f} ± {top['eval_success_std']:.3f}."
+            )
+        lines.append("")
+    if not certainty_summary.empty:
+        lines.append("Episode-level certainty behavior:")
+        lines.append("")
+        for _, row in certainty_summary.sort_values(["mode", "method"]).iterrows():
+            lines.append(
+                f"- {row['mode']} / {row['method']}: mean episode certainty {row['mean_episode_certainty']:.3f}, mean corr(certainty, delta) {row['certainty_delta_corr_mean']:.3f}, mean corr(certainty, action_prob) {row['certainty_action_prob_corr_mean']:.3f}, mean corr(certainty, runner_up_prob) {row['certainty_runner_up_prob_corr_mean']:.3f}."
+            )
+        lines.append("")
+    return lines
+
+
+def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, updates: pd.DataFrame, report_dir: Path) -> None:
+    evals = load_eval_logs(report_dir)
     traj_auc, step_auc = _compute_auc_tables(episodes, steps)
     per_seed, agg = _compute_episode_tables(episodes, last_n=20)
-    evals = load_eval_logs(report_dir)
+    certainty_summary = _compute_certainty_episode_summary(episodes)
+    best_rows = _selection_best_rows(evals)
+    best_challenge = _best_checkpoint_challenge(evals, best_rows)
 
-    if not agg.empty:
-        lines += [
-            "## Final metrics (last 20 episodes per run; mean ± std over seeds)",
-            "",
-            "| method | mode | final return | final success | best-window return | best-window success |",
-            "|---|---|---:|---:|---:|---:|",
-        ]
-        for _, r in agg.sort_values(["mode", "method"]).iterrows():
-            lines.append(
-                "| {method} | {mode} | {ret} | {succ} | {bret:.1f} | {bsucc:.3f} |".format(
-                    method=r["method"],
-                    mode=r["mode"],
-                    ret=_format_mean_std(float(r["final_return_mean"]), float(r["final_return_std"]), digits=1),
-                    succ=_format_mean_std(float(r["final_success_mean"]), float(r["final_success_std"]), digits=3),
-                    bret=float(r["best_window_return_mean"]),
-                    bsucc=float(r["best_window_success_mean"]),
-                )
-            )
-        lines.append("")
-
-    if not traj_auc.empty or not step_auc.empty:
-        auc_table = traj_auc.merge(step_auc, on=["method", "mode"], how="outer")
-        lines += [
-            "## AUROC diagnostics (by method × mode)",
-            "",
-            "| method | mode | trajectory AUROC (success ~ mean certainty) | timestep AUROC (late_phase ~ 1-certainty) |",
-            "|---|---|---:|---:|",
-        ]
-        for _, r in auc_table.sort_values(["mode", "method"]).iterrows():
-            ta = r.get("trajectory_auroc", math.nan)
-            sa = r.get("timestep_auroc", math.nan)
-            lines.append(
-                "| {method} | {mode} | {ta} | {sa} |".format(
-                    method=r["method"],
-                    mode=r["mode"],
-                    ta=("n/a" if not math.isfinite(float(ta)) else f"{float(ta):.3f}"),
-                    sa=("n/a" if not math.isfinite(float(sa)) else f"{float(sa):.3f}"),
-                )
-            )
-        lines.append("")
-
-    # summary.md is intentionally not written; report.md contains the full summary.
-
-    # Paper-ready extended report.
-    report = []
-    report += [
+    report = [
         "# RL Experiment Report",
         "",
-        "This report summarizes the selected sweep from the CSV logs.",
+        "This report summarizes the selected sweep from the generated CSV logs.",
         "",
         f"Source folder: `{report_dir}`",
         "",
         "Reproducibility files: `config.yaml`, `summary.json`, per-seed `*_summary.json`, and per-seed CSV logs are generated with each run. Git tracks only `report.md` by default; generated logs/checkpoints/plots are ignored.",
         "",
-        "## Notes on experimental modes",
-        "",
-        "- **Reward semantics**: logs include `return_train` (optimizer reward) and `return_env` (raw dense environment return). Plot/report curves use `return_env` unless stated otherwise.",
-        "- **REWARD_NOISE**: false-negative successes set terminal `policy_success` to `0` during training. Checkpoint selection evaluates on clean held-out episodes because reward noise is training-only corruption.",
-        "- **OBS_NOISE**: adds Gaussian noise \(\\sigma=0.1\\) to observations at every step.",
-        "- **AC v3**: AC methods use standard PPO with certainty-gated advantages; runner-up statistics supervise the certainty network only.",
-        "",
-        "## Seed aggregation",
-        "",
-        "Learning curves are computed **per seed** and then aggregated (mean ± std). This avoids interleaving seeds (each run resets `step` to 0).",
-        "",
     ]
+    report += _lines_from_protocol(episodes, evals)
 
     if not agg.empty:
         report += [
-            "## Summary table (mean ± std over 5 seeds)",
+            "## Summary table (mean ± std over seeds)",
             "",
             "| mode | method | final return (last 20 eps) | final success (last 20 eps) | best rolling-20 return | best rolling-20 success |",
             "|---|---|---:|---:|---:|---:|",
@@ -464,30 +644,65 @@ def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, report_dir: Path) 
             )
         report.append("")
 
-    if not evals.empty:
-        eval_summary = (
-            evals.groupby(["method", "mode", "seed", "checkpoint"])
-            .agg(eval_return=("return", "mean"), eval_success=("success", "mean"), eval_length=("episode_length", "mean"))
-            .reset_index()
-        )
-        best_rows = eval_summary.sort_values("eval_return", ascending=False).groupby(["method", "mode", "seed"]).head(1)
+    if not best_rows.empty:
         report += [
-            "## Best checkpoint by greedy held-out evaluation",
+            "## Best checkpoint by primary greedy held-out selection",
             "",
-            "Checkpoints are evaluated greedily on fixed held-out seeds. The final checkpoint is not assumed to be best.",
-            "",
-            "| mode | method | seed | checkpoint | eval return | eval success |",
-            "|---|---|---:|---|---:|---:|",
+            "| mode | method | seed | checkpoint | eval mode | eval return | eval success |",
+            "|---|---|---:|---|---|---:|---:|",
         ]
         for _, r in best_rows.sort_values(["mode", "method", "seed"]).iterrows():
             report.append(
-                "| {mode} | {method} | {seed} | {checkpoint} | {ret:.1f} | {succ:.3f} |".format(
+                "| {mode} | {method} | {seed} | {checkpoint} | {eval_mode} | {ret:.1f} | {succ:.3f} |".format(
                     mode=r["mode"],
                     method=r["method"],
                     seed=int(r["seed"]),
                     checkpoint=r["checkpoint"],
+                    eval_mode=r["eval_mode"],
                     ret=float(r["eval_return"]),
                     succ=float(r["eval_success"]),
+                )
+            )
+        report.append("")
+
+    if not best_challenge.empty:
+        report += [
+            "## Best-checkpoint challenge tests",
+            "",
+            "| training mode | method | test condition | eval mode | obs sigma | return | success |",
+            "|---|---|---|---|---:|---:|---:|",
+        ]
+        for _, r in best_challenge.sort_values(["mode", "method", "eval_name"]).iterrows():
+            sigma = float(r["eval_obs_noise_sigma"]) if math.isfinite(float(r["eval_obs_noise_sigma"])) else math.nan
+            report.append(
+                "| {mode} | {method} | {eval_name} | {eval_mode} | {sigma} | {ret} | {succ} |".format(
+                    mode=r["mode"],
+                    method=r["method"],
+                    eval_name=r["eval_name"],
+                    eval_mode=r["eval_mode"],
+                    sigma=("n/a" if not math.isfinite(sigma) else f"{sigma:.2f}"),
+                    ret=_format_mean_std(float(r["eval_return_mean"]), float(r["eval_return_std"]), digits=1),
+                    succ=_format_mean_std(float(r["eval_success_mean"]), float(r["eval_success_std"]), digits=3),
+                )
+            )
+        report.append("")
+
+    if not certainty_summary.empty:
+        report += [
+            "## Episode-level certainty summary",
+            "",
+            "| mode | method | mean c_i | corr(c, delta) | corr(c, action prob) | corr(c, runner-up prob) |",
+            "|---|---|---:|---:|---:|---:|",
+        ]
+        for _, r in certainty_summary.sort_values(["mode", "method"]).iterrows():
+            report.append(
+                "| {mode} | {method} | {c:.3f} | {cd:.3f} | {ca:.3f} | {cr:.3f} |".format(
+                    mode=r["mode"],
+                    method=r["method"],
+                    c=float(r["mean_episode_certainty"]),
+                    cd=float(r["certainty_delta_corr_mean"]),
+                    ca=float(r["certainty_action_prob_corr_mean"]),
+                    cr=float(r["certainty_runner_up_prob_corr_mean"]),
                 )
             )
         report.append("")
@@ -496,9 +711,6 @@ def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, report_dir: Path) 
         auc_table = traj_auc.merge(step_auc, on=["method", "mode"], how="outer")
         report += [
             "## Certainty AUROC diagnostics",
-            "",
-            "- **Trajectory AUROC**: episode success predicted by mean certainty over the trajectory.",
-            "- **Timestep AUROC**: late-phase indicator predicted by \(1 - certainty\\) (diagnostic).",
             "",
             "| mode | method | trajectory AUROC | timestep AUROC |",
             "|---|---|---:|---:|",
@@ -516,6 +728,7 @@ def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, report_dir: Path) 
             )
         report.append("")
 
+    report += _lines_from_auto_analysis(agg, best_rows, best_challenge, certainty_summary)
     report += [
         "## Plots",
         "",
@@ -537,18 +750,17 @@ def main() -> None:
     args = parse_args()
     ensure_output_dirs()
     args.plot_dir.mkdir(parents=True, exist_ok=True)
-    episodes, steps = load_logs(args.log_dir)
+    episodes, steps, updates = load_logs(args.log_dir)
     if episodes.empty:
         raise SystemExit(f"No episode logs found in {args.log_dir}")
     save_return_vs_steps(episodes, args.plot_dir)
     save_success_vs_steps(episodes, args.plot_dir)
     save_metric_by_mode_subplots(episodes, "return", "return", "Return vs steps by mode", "06_return_by_mode_subplots.png", args.plot_dir)
     save_metric_by_mode_subplots(episodes, "success", "success rate", "Success rate vs steps by mode", "07_success_by_mode_subplots.png", args.plot_dir)
-    if not steps.empty and "certainty" in steps:
-        save_certainty_histogram(steps, args.plot_dir)
-        save_scatter(steps, "entropy", "certainty", "04_certainty_vs_entropy_scatter.png", "Certainty vs entropy scatter", args.plot_dir)
-        save_scatter(steps, "delta", "certainty", "05_certainty_vs_delta_t_scatter.png", "Certainty vs delta_t scatter", args.plot_dir)
-    write_report(episodes, steps, args.log_dir)
+    save_certainty_histogram(episodes, steps, args.plot_dir)
+    save_scatter(steps, "entropy", "certainty", "04_certainty_vs_entropy_scatter.png", "Certainty vs entropy scatter", args.plot_dir)
+    save_scatter(steps, "delta", "certainty", "05_certainty_vs_delta_t_scatter.png", "Certainty vs delta_t scatter", args.plot_dir)
+    write_report(episodes, steps, updates, args.log_dir)
 
 
 if __name__ == "__main__":
