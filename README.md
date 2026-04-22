@@ -1,10 +1,16 @@
-# AC-GRPO: Alignment-Certainty Group Relative Policy Optimization
+# AC-PPO: Alignment-Certainty PPO Diagnostic
 
-A `LunarLander-v2` diagnostic for **AC-GRPO** — a policy optimization method that learns a per-timestep certainty signal to gate and stabilize policy updates.
+A `LunarLander-v2` diagnostic for **AC-PPO** — a PPO-based policy optimization variant that learns a per-timestep certainty signal to gate and stabilize policy updates.
 
 The goal is to evaluate whether learned certainty can improve robustness when supervision is sparse, delayed, noisy, or dense but unreliable at the step level.
 
 This diagnostic is designed as a controlled precursor to applying AC-style optimization to large-scale reinforcement learning systems such as **vision-language-action (VLA)** models.
+
+The current repository implementation is **PPO-based**, not a standalone GRPO trainer. In other words:
+
+- `BASELINE` is PPO with a critic and GAE.
+- `AC_LITE` and `AC_FULL` are certainty-gated PPO variants built on the same actor-critic backbone.
+- The pretrained anchor may come from an external or earlier **GRPO-style** baseline, but GRPO is **not** currently implemented here as a separate training branch.
 
 At a high level, the methodology follows the same intuition as **SimpleVLA-RL**:
 
@@ -27,7 +33,7 @@ At a high level, the methodology follows the same intuition as **SimpleVLA-RL**:
 - [Pretrained Anchor](#pretrained-anchor)
 - [Baseline Policy Optimization](#baseline-policy-optimization)
 - [Grouped Rollouts and Dynamic Sampling](#grouped-rollouts-and-dynamic-sampling)
-- [AC-GRPO: Certainty and Alignment](#ac-grpo-certainty-and-alignment)
+- [AC-PPO: Certainty and Alignment](#ac-ppo-certainty-and-alignment)
 - [Per-Step Mixture MLE](#per-step-mixture-mle)
 - [Certainty-Gated Policy Objective](#certainty-gated-policy-objective)
 - [Trajectory-Level Outcome MLE — AC_FULL](#trajectory-level-outcome-mle--ac_full)
@@ -151,11 +157,29 @@ Both policy and certainty networks receive corrupted observations.
 
 | Method     | Description                                                                             |
 |------------|-----------------------------------------------------------------------------------------|
-| `BASELINE` | Standard PPO under the chosen reward signal                                             |
-| `AC_LITE`  | Standard PPO with certainty-gated advantages; certainty trained by per-step mixture MLE |
+| `BASELINE` | Standard PPO under the chosen reward signal, with GAE and a critic                      |
+| `AC_LITE`  | PPO with detached certainty-gated advantages; certainty trained by per-step mixture MLE |
 | `AC_FULL`  | `AC_LITE` plus trajectory-level outcome MLE for certainty (sparse reward only)          |
 
 > **AC_FULL and dense reward.** The trajectory-level outcome MLE supervises certainty using the binary episode outcome $R_i$. Under dense reward, this binary signal is weaker relative to the per-step advantage signal, and the outcome NLL provides less marginal information over what the per-step mixture MLE already captures. `AC_FULL` is therefore most meaningful in the sparse reward setting where the outcome is the primary available signal. In dense reward experiments, `AC_LITE` is the recommended AC variant.
+
+### Implemented Models in This Repository
+
+The current codebase supports the following method families:
+
+| Model family | Reward mode | Critic | Advantage estimator | Certainty gate |
+|---|---|---:|---|---|
+| PPO baseline | Sparse | Yes | GAE | No |
+| PPO baseline | Dense | Yes | GAE | No |
+| AC-PPO Lite | Sparse | Yes | GAE | Yes, detached $c_t \cdot \hat{A}_t$ |
+| AC-PPO Lite | Dense | Yes | GAE | Yes, detached $c_t \cdot \hat{A}_t$ |
+| AC-PPO Full | Sparse | Yes | GAE | Yes, detached $c_t \cdot \hat{A}_t$ |
+
+`AC_FULL` is implemented in dense mode for compatibility, but its extra trajectory-level certainty loss is disabled there, so the dense `AC_FULL` path is effectively equivalent to dense `AC_LITE` in the current code.
+
+### Pretrained Anchor
+
+The default pretrained checkpoint may come from a GRPO-style clean baseline. In the current repository, however, that checkpoint is used only as a **shared initialization anchor** for PPO/AC-PPO adaptation. It is not presented as a separately trained comparison branch unless an explicit GRPO trainer is added later.
 
 ---
 
@@ -255,7 +279,7 @@ If no mixed groups are found in an update window, the full sample is used and th
 
 ---
 
-## AC-GRPO: Certainty and Alignment
+## AC-PPO: Certainty and Alignment
 
 ### Runner-Up Action
 
@@ -318,27 +342,15 @@ $$\frac{\partial \mathcal{L}_t^{\text{mix}}}{\partial c_t} = -\frac{\pi_\theta(a
 
 The fixed point is $c_t^* = \delta_t$: certainty converges to the runner-up margin.
 
-### Gradient on the Policy Network
+### Role of the Mixture Loss in the Current Code
 
-With $c_t$ fixed, the policy gradient flows through both action probabilities in the mixture. At initialisation ($c_t \approx 0.5$, $\pi(a_t) \approx \pi(\hat{a}_t)$) this reduces to the standard policy gradient, so **there is no cold-start problem**.
+In the current implementation, the mixture loss is used to train the **certainty network**, not to define the policy gradient. The actor update uses the standard PPO ratio, and the runner-up appears only inside the certainty objective and diagnostics.
 
-### Gradient Isolation
+The certainty loss itself is implemented without internal `.detach()` calls. Policy/certainty isolation is handled by:
 
-The mixture loss is a single mathematical object used in **two separate backward passes** — once for the policy optimizer, once for the certainty optimizer. No `.detach()` calls are needed inside the loss function. Isolation is enforced by the training loop:
-
-```python
-# Policy pass
-optimizer_theta.zero_grad()
-policy_loss.backward(retain_graph=True)
-optimizer_theta.step()
-
-# Certainty pass
-optimizer_psi.zero_grad()
-cert_loss.backward()
-optimizer_psi.step()
-```
-
-Each optimizer's `.step()` only touches its own parameter group. Gradients that cross the boundary are computed but never applied.
+- independent policy and certainty networks
+- separate optimizers
+- a detached certainty gate in the actor loss
 
 ---
 
@@ -357,6 +369,14 @@ where $r_t(\theta)$ is the **standard PPO ratio**:
 $$r_t(\theta) = \frac{\pi_\theta(a_t \mid s_t)}{\pi_{\text{old}}(a_t \mid s_t)}$$
 
 The stop-gradient on $c_t$ prevents the policy loss from updating the certainty network.
+
+In the current code this is implemented as:
+
+```python
+\hat{A}_t^{AC} = \mathrm{stopgrad}(c_t) \cdot \hat{A}_t
+```
+
+So the repository's AC methods are best understood as **certainty-gated PPO**, not as a separate runner-up-driven policy optimizer.
 
 **Behavioural interpretation:**
 
@@ -428,11 +448,30 @@ $$\mathcal{L}_{\text{cert}}^{\text{AC-FULL}} = \underbrace{-\frac{1}{T}\sum_{t=1
 Policy and certainty networks use **separate optimizers** with independent learning rates.
 
 ```python
-policy_lr:    float  # default: 3e-4
-certainty_lr: float  # default: 3e-4
+policy_lr:    float  # current default: 1e-4
+certainty_lr: float  # current default: 1e-4
 ```
 
-Gradient isolation is guaranteed by architecture (no shared parameters) and enforced by the training loop (separate `zero_grad / backward / step` blocks). No `.detach()` calls are needed inside any loss function.
+Gradient isolation is guaranteed by architecture (no shared parameters) and enforced by the training loop (separate `zero_grad / backward / step` blocks). The actor loss uses a detached certainty gate, while the certainty losses themselves contain no internal `.detach()` calls.
+
+### Current Reproduction-Critical Defaults
+
+The current implementation uses the following important defaults:
+
+| Parameter | Value |
+|---|---:|
+| `policy_lr` | `1e-4` |
+| `certainty_lr` | `1e-4` |
+| `update_epochs` | `4` |
+| `checkpoint_interval` | `10_000` |
+| `eval_seeds` | `(101, 102, 103)` |
+| `eval_episodes_per_seed` | `5` |
+| `group_size` | `4` |
+| `max_group_attempts_per_update` | `256` |
+| `dynamic_sampling_warmup_steps` | `10_000` in the current experiment grid |
+| `skip_policy_update_on_unmixed_fallback` | `True` |
+
+Pretrained loading is actor-only by default unless critic loading is explicitly enabled in code.
 
 ---
 
@@ -509,10 +548,10 @@ All methods share:
 - Identical rollout pipeline
 - Identical pretrained anchor
 
-Only the certainty mechanism differs. The AC objectives introduce **no free hyperparameters** beyond the learning rate: the per-step and trajectory-level terms are log-likelihoods from independent observations of the same latent certainty variable, and their sum follows from the joint MLE without a mixing coefficient.
+Only the certainty mechanism differs. In implementation terms, the current project compares **PPO** against **certainty-gated PPO** on the same actor-critic backbone.
 
 The core theoretical claim being tested is:
 
-> A certainty signal trained from action commitment alone — with no direct access to reward — can identify unreliable training steps and reduce their contribution to the policy gradient, improving robustness under noisy or sparse supervision.
+> A certainty signal trained from action commitment alone — with no direct access to reward — can identify unreliable training steps and reduce their contribution to the PPO policy gradient, improving robustness under noisy or sparse supervision.
 
 The primary falsification criterion is performance under `REWARD_NOISE`: AC methods should outperform `BASELINE` specifically in the noisy supervision regime. Matching `BASELINE` under `CLEAN` while outperforming it under `REWARD_NOISE` constitutes a positive result. Underperforming under `CLEAN` is not expected and would indicate a problem with the certainty mechanism.
