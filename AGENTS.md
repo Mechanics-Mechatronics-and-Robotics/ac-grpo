@@ -9,7 +9,7 @@ README.md is the source of truth for:
 * task setup
 * sparse reward semantics
 * method definitions
-* AC-GRPO mathematical structure
+* AC-models mathematical structure
 * evaluation protocol
 
 This file defines execution rules for code changes only.
@@ -77,7 +77,7 @@ Unless clearly broken, use these defaults:
 * epsilon_low = 0.2
 * epsilon_high = 0.2
 
-All 9 branches should use the same defaults unless a mode-specific corruption is already part of the implementation.
+All experiment branches should use the same defaults unless a mode-specific corruption is already part of the implementation.
 
 ---
 
@@ -99,22 +99,27 @@ A global experiment launch must create exactly one timestamped folder under `out
 
 Inside it create exactly these branch folders:
 
-* baseline_clean
-* baseline_obs_noise
-* baseline_reward_noise
-* ac_lite_clean
-* ac_lite_obs_noise
-* ac_lite_reward_noise
-* ac_full_clean
-* ac_full_obs_noise
-* ac_full_reward_noise
+* baseline_sparse_clean
+* baseline_sparse_obs_noise
+* baseline_sparse_reward_noise
+* baseline_dense_clean
+* baseline_dense_obs_noise
+* baseline_dense_reward_noise
+* ac_lite_sparse_clean
+* ac_lite_sparse_obs_noise
+* ac_lite_sparse_reward_noise
+* ac_lite_dense_clean
+* ac_lite_dense_obs_noise
+* ac_lite_dense_reward_noise
+* ac_full_sparse_clean
+* ac_full_sparse_obs_noise
+* ac_full_sparse_reward_noise
 
 Each branch folder must contain:
 
 * config.yaml
 * summary.json
 * report.md
-* plots/
 * seed_42/
 * seed_0/
 * seed_17/

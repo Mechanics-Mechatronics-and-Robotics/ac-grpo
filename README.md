@@ -553,5 +553,3 @@ Only the certainty mechanism differs. In implementation terms, the current proje
 The core theoretical claim being tested is:
 
 > A certainty signal trained from action commitment alone — with no direct access to reward — can identify unreliable training steps and reduce their contribution to the PPO policy gradient, improving robustness under noisy or sparse supervision.
-
-The primary falsification criterion is performance under `REWARD_NOISE`: AC methods should outperform `BASELINE` specifically in the noisy supervision regime. Matching `BASELINE` under `CLEAN` while outperforming it under `REWARD_NOISE` constitutes a positive result. Underperforming under `CLEAN` is not expected and would indicate a problem with the certainty mechanism.
