@@ -38,7 +38,7 @@ BEST_EXPERIMENT_SETTINGS = {
     "rollout_temperature": 1.0,
     "epsilon_low": 0.2,
     "epsilon_high": 0.2,
-    "total_steps": 500_000,
+    "total_steps": 1000_000,
     "dynamic_sampling_warmup_steps": 10_000,
     "reward_mode": "SPARSE",
 }
@@ -127,7 +127,7 @@ class TrainConfig:
     pretrained_policy_path: str | None = str(DEFAULT_PRETRAINED_POLICY)
     load_pretrained_critic: bool = False
     freeze_pretrained_policy: bool = False
-    checkpoint_interval: int = 10_000
+    checkpoint_interval: int = 50_000
     eval_seeds: tuple[int, ...] = (101, 102, 103)
     eval_episodes_per_seed: int = 5
     test_eval_seeds: tuple[int, ...] = (201, 202, 203, 204, 205)

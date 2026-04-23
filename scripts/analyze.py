@@ -39,6 +39,11 @@ METHOD_ORDER = (
 
 MODE_ORDER = ("CLEAN", "OBS_NOISE", "REWARD_NOISE")
 
+try:
+    plt.style.use("seaborn-v0_8-whitegrid")
+except OSError:
+    pass
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate AC-PPO diagnostic plots and report.")
@@ -180,6 +185,42 @@ def _seed_mean_curve(
     return grid, mat.mean(axis=0), mat.std(axis=0, ddof=0)
 
 
+def _compute_reward_auc_tables(episodes: pd.DataFrame, window: int = 20) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if episodes.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    per_seed_rows = []
+    for (method, mode, seed), group in episodes.groupby(["method", "mode", "seed"]):
+        g = group.sort_values("step")
+        x = pd.to_numeric(g["step"], errors="coerce").to_numpy(dtype=float)
+        y = rolling_mean(pd.to_numeric(g["return"], errors="coerce"), window=window).to_numpy(dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        x = x[mask]
+        y = y[mask]
+        if len(x) < 2:
+            auc = math.nan
+        else:
+            order = np.argsort(x)
+            x = x[order]
+            y = y[order]
+            x_unique, idx = np.unique(x, return_index=True)
+            y_unique = y[idx]
+            auc = math.nan
+            if len(x_unique) >= 2 and x_unique[-1] > x_unique[0]:
+                auc = float(np.trapz(y_unique, x_unique) / (x_unique[-1] - x_unique[0]))
+        per_seed_rows.append({"method": method, "mode": mode, "seed": seed, "reward_auc": auc})
+
+    per_seed = pd.DataFrame(per_seed_rows)
+    if per_seed.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    agg = (
+        per_seed.groupby(["method", "mode"])
+        .agg(reward_auc_mean=("reward_auc", "mean"), reward_auc_std=("reward_auc", "std"))
+        .reset_index()
+    )
+    return per_seed, agg
+
+
 def _format_mean_std(mean: float, std: float, digits: int = 1) -> str:
     if math.isfinite(mean) and not math.isfinite(std):
         std = 0.0
@@ -206,14 +247,34 @@ def _ordered_groups(df: pd.DataFrame, group_cols: list[str]) -> list[tuple[tuple
     return sorted(groups, key=sort_key)
 
 
-def save_return_vs_steps(episodes: pd.DataFrame, plot_dir: Path) -> None:
+def _method_linewidth(method: str) -> float:
+    return 3.0 if str(method).endswith("_DENSE") else 2.0
+
+
+def _auc_label(method: str, mode: str, reward_auc: pd.DataFrame) -> str:
+    row = reward_auc[(reward_auc["method"] == method) & (reward_auc["mode"] == mode)]
+    if row.empty:
+        return f"{method} {mode}"
+    mean = float(row.iloc[0]["reward_auc_mean"])
+    std = float(row.iloc[0]["reward_auc_std"])
+    return f"{method} {mode} | AUC {_format_mean_std(mean, std, digits=1)}"
+
+
+def save_return_vs_steps(episodes: pd.DataFrame, reward_auc: pd.DataFrame, plot_dir: Path) -> None:
     plt.figure(figsize=(10, 6))
     for (method, mode), group in _ordered_groups(episodes, ["method", "mode"]):
         x, mean, std = _seed_mean_curve(group, "return", window=20, grid_points=250)
         if len(x) == 0:
             continue
         color = METHOD_COLORS.get(str(method))
-        plt.plot(x, mean, label=f"{method} {mode}", color=color, linestyle=MODE_LINESTYLES.get(str(mode), "-"))
+        plt.plot(
+            x,
+            mean,
+            label=_auc_label(str(method), str(mode), reward_auc),
+            color=color,
+            linestyle=MODE_LINESTYLES.get(str(mode), "-"),
+            linewidth=_method_linewidth(str(method)),
+        )
         plt.fill_between(x, mean - std, mean + std, color=color, alpha=0.15)
     plt.xlabel("steps")
     plt.ylabel("return")
@@ -227,14 +288,21 @@ def save_return_vs_steps(episodes: pd.DataFrame, plot_dir: Path) -> None:
     plt.close()
 
 
-def save_success_vs_steps(episodes: pd.DataFrame, plot_dir: Path) -> None:
+def save_success_vs_steps(episodes: pd.DataFrame, reward_auc: pd.DataFrame, plot_dir: Path) -> None:
     plt.figure(figsize=(10, 6))
     for (method, mode), group in _ordered_groups(episodes, ["method", "mode"]):
         x, mean, std = _seed_mean_curve(group, "success", window=20, grid_points=250)
         if len(x) == 0:
             continue
         color = METHOD_COLORS.get(str(method))
-        plt.plot(x, mean, label=f"{method} {mode}", color=color, linestyle=MODE_LINESTYLES.get(str(mode), "-"))
+        plt.plot(
+            x,
+            mean,
+            label=_auc_label(str(method), str(mode), reward_auc),
+            color=color,
+            linestyle=MODE_LINESTYLES.get(str(mode), "-"),
+            linewidth=_method_linewidth(str(method)),
+        )
         plt.fill_between(x, np.clip(mean - std, 0.0, 1.0), np.clip(mean + std, 0.0, 1.0), color=color, alpha=0.15)
     plt.xlabel("steps")
     plt.ylabel("success rate")
@@ -250,6 +318,7 @@ def save_success_vs_steps(episodes: pd.DataFrame, plot_dir: Path) -> None:
 
 def save_metric_by_mode_subplots(
     episodes: pd.DataFrame,
+    reward_auc: pd.DataFrame,
     y_col: str,
     ylabel: str,
     title: str,
@@ -264,17 +333,21 @@ def save_metric_by_mode_subplots(
             if len(x) == 0:
                 continue
             color = METHOD_COLORS.get(str(method))
-            ax.plot(x, mean, label=str(method), color=color)
+            auc_row = reward_auc[(reward_auc["method"] == str(method)) & (reward_auc["mode"] == mode)]
+            auc_text = ""
+            if not auc_row.empty:
+                auc_text = f" | AUC {_format_mean_std(float(auc_row.iloc[0]['reward_auc_mean']), float(auc_row.iloc[0]['reward_auc_std']), digits=1)}"
+            ax.plot(x, mean, label=f"{method}{auc_text}", color=color, linewidth=_method_linewidth(str(method)))
             lower = np.clip(mean - std, 0.0, 1.0) if y_col == "success" else mean - std
             upper = np.clip(mean + std, 0.0, 1.0) if y_col == "success" else mean + std
             ax.fill_between(x, lower, upper, color=color, alpha=0.15)
         ax.set_title(mode)
         ax.set_xlabel("steps")
         ax.grid(alpha=0.25)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(handles, labels, fontsize=8)
     axes[0].set_ylabel(ylabel)
-    handles, labels = axes[-1].get_legend_handles_labels()
-    if handles:
-        axes[-1].legend(handles, labels, fontsize=8)
     fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(plot_dir / filename)
@@ -295,17 +368,40 @@ def save_certainty_histogram(episodes: pd.DataFrame, steps: pd.DataFrame, plot_d
     cert_df = cert_df.dropna(subset=["certainty", "success"])
     if cert_df.empty:
         return
-    bins = np.linspace(0.0, 1.0, 61)
+    x_min = float(cert_df["certainty"].min())
+    x_max = float(cert_df["certainty"].max())
+    if not math.isfinite(x_min) or not math.isfinite(x_max):
+        return
+    if x_max <= x_min:
+        x_min, x_max = max(0.0, x_min - 0.05), min(1.0, x_max + 0.05)
+    pad = max(0.01, 0.05 * (x_max - x_min))
+    x_low = max(0.0, x_min - pad)
+    x_high = min(1.0, x_max + pad)
+    bins = np.linspace(x_low, x_high, 81)
     success_vals = cert_df[cert_df["success"] >= 0.5]["certainty"].to_numpy(dtype=float)
     fail_vals = cert_df[cert_df["success"] < 0.5]["certainty"].to_numpy(dtype=float)
     plt.figure(figsize=(8, 6))
+    grid = np.linspace(x_low, x_high, 300)
+    bin_width = bins[1] - bins[0]
+
+    def smooth_counts(values: np.ndarray) -> np.ndarray:
+        if len(values) == 0:
+            return np.zeros_like(grid)
+        bw = max(0.01, np.std(values) * 0.2)
+        density = np.exp(-0.5 * ((grid[:, None] - values[None, :]) / bw) ** 2).sum(axis=1)
+        density /= max(len(values), 1) * bw * math.sqrt(2.0 * math.pi)
+        return density * len(values) * bin_width
+
     if len(success_vals):
-        plt.hist(success_vals, bins=bins, color="blue", alpha=0.55, label="success")
+        plt.hist(success_vals, bins=bins, color="blue", alpha=0.40, label="success")
+        plt.plot(grid, smooth_counts(success_vals), color="blue", linewidth=1.2)
     if len(fail_vals):
-        plt.hist(fail_vals, bins=bins, color="red", alpha=0.55, label="failure")
+        plt.hist(fail_vals, bins=bins, color="red", alpha=0.40, label="failure")
+        plt.plot(grid, smooth_counts(fail_vals), color="red", linewidth=1.2)
     plt.xlabel("timestep certainty")
     plt.ylabel("count")
     plt.title("Timestep certainty histogram")
+    plt.xlim(x_low, x_high)
     plt.grid(alpha=0.25)
     handles, labels = plt.gca().get_legend_handles_labels()
     if handles:
@@ -439,6 +535,17 @@ def _compute_certainty_episode_summary(episodes: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index()
     )
+
+
+def _method_display_name(method: str) -> str:
+    mapping = {
+        "BASELINE_SPARSE": "Baseline (Sparse)",
+        "BASELINE_DENSE": "Baseline (Dense)",
+        "AC_LITE_SPARSE": "AC-LITE (Sparse)",
+        "AC_LITE_DENSE": "AC-LITE (Dense)",
+        "AC_FULL_SPARSE": "AC-FULL (Sparse)",
+    }
+    return mapping.get(method, method)
 
 
 def _selection_best_rows(evals: pd.DataFrame) -> pd.DataFrame:
@@ -585,10 +692,27 @@ def _lines_from_auto_analysis(agg: pd.DataFrame, best_rows: pd.DataFrame, best_c
     return lines
 
 
+def _cross_test_obs_table(best_challenge: pd.DataFrame) -> pd.DataFrame:
+    if best_challenge.empty:
+        return pd.DataFrame()
+    mapping = {
+        "CLEAN": "Train: CLEAN → Test OBS",
+        "OBS_NOISE": "Train: OBS → Test OBS",
+        "REWARD_NOISE": "Train: REWARD → Test OBS",
+    }
+    obs = best_challenge[best_challenge["eval_name"] == "test_obs_noise"].copy()
+    if obs.empty:
+        return pd.DataFrame()
+    obs["column"] = obs["mode"].map(mapping)
+    obs["display_method"] = obs["method"].map(_method_display_name)
+    return obs
+
+
 def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, updates: pd.DataFrame, report_dir: Path) -> None:
     evals = load_eval_logs(report_dir)
     traj_auc, step_auc = _compute_auc_tables(episodes, steps)
     per_seed, agg = _compute_episode_tables(episodes, last_n=20)
+    reward_auc_per_seed, reward_auc = _compute_reward_auc_tables(episodes, window=20)
     certainty_summary = _compute_certainty_episode_summary(episodes)
     best_rows = _selection_best_rows(evals)
     best_challenge = _best_checkpoint_challenge(evals, best_rows)
@@ -609,16 +733,18 @@ def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, updates: pd.DataFr
         report += [
             "## Summary table (mean ± std over seeds)",
             "",
-            "| mode | method | final return (last 20 eps) | final success (last 20 eps) | best rolling-20 return | best rolling-20 success |",
-            "|---|---|---:|---:|---:|---:|",
+            "| mode | method | final return (last 20 eps) | final success (last 20 eps) | reward AUC | best rolling-20 return | best rolling-20 success |",
+            "|---|---|---:|---:|---:|---:|---:|",
         ]
-        for _, r in agg.sort_values(["mode", "method"]).iterrows():
+        merged = agg.merge(reward_auc, on=["method", "mode"], how="left")
+        for _, r in merged.sort_values(["mode", "method"]).iterrows():
             report.append(
-                "| {mode} | {method} | {ret} | {succ} | {bret:.1f} | {bsucc:.3f} |".format(
+                "| {mode} | {method} | {ret} | {succ} | {auc} | {bret:.1f} | {bsucc:.3f} |".format(
                     mode=r["mode"],
                     method=r["method"],
                     ret=_format_mean_std(float(r["final_return_mean"]), float(r["final_return_std"]), digits=1),
                     succ=_format_mean_std(float(r["final_success_mean"]), float(r["final_success_std"]), digits=3),
+                    auc=_format_mean_std(float(r.get("reward_auc_mean", math.nan)), float(r.get("reward_auc_std", math.nan)), digits=1),
                     bret=float(r["best_window_return_mean"]),
                     bsucc=float(r["best_window_success_mean"]),
                 )
@@ -687,6 +813,32 @@ def write_report(episodes: pd.DataFrame, steps: pd.DataFrame, updates: pd.DataFr
             )
         report.append("")
 
+    cross_obs = _cross_test_obs_table(best_challenge)
+    if not cross_obs.empty:
+        columns = ["Train: CLEAN → Test OBS", "Train: OBS → Test OBS", "Train: REWARD → Test OBS"]
+        report += [
+            "## Cross-test summary on OBS evaluation",
+            "",
+            "| Method | Train: CLEAN → Test OBS | Train: OBS → Test OBS | Train: REWARD → Test OBS |",
+            "|---|---:|---:|---:|",
+        ]
+        for method in [_method_display_name(m) for m in METHOD_ORDER]:
+            row = [f"| {method} "]
+            method_df = cross_obs[cross_obs["display_method"] == method]
+            for col in columns:
+                cell_df = method_df[method_df["column"] == col]
+                if cell_df.empty:
+                    row.append("| n/a ")
+                else:
+                    r = cell_df.iloc[0]
+                    cell = (
+                        f"| {_format_mean_std(float(r['eval_return_mean']), float(r['eval_return_std']), digits=1)} / "
+                        f"{_format_mean_std(float(r['eval_success_mean']), float(r['eval_success_std']), digits=3)} "
+                    )
+                    row.append(cell)
+            report.append("".join(row) + "|")
+        report.append("")
+
     if not certainty_summary.empty:
         report += [
             "## Episode-level certainty summary",
@@ -753,10 +905,11 @@ def main() -> None:
     episodes, steps, updates = load_logs(args.log_dir)
     if episodes.empty:
         raise SystemExit(f"No episode logs found in {args.log_dir}")
-    save_return_vs_steps(episodes, args.plot_dir)
-    save_success_vs_steps(episodes, args.plot_dir)
-    save_metric_by_mode_subplots(episodes, "return", "return", "Return vs steps by mode", "06_return_by_mode_subplots.png", args.plot_dir)
-    save_metric_by_mode_subplots(episodes, "success", "success rate", "Success rate vs steps by mode", "07_success_by_mode_subplots.png", args.plot_dir)
+    _, reward_auc = _compute_reward_auc_tables(episodes, window=20)
+    save_return_vs_steps(episodes, reward_auc, args.plot_dir)
+    save_success_vs_steps(episodes, reward_auc, args.plot_dir)
+    save_metric_by_mode_subplots(episodes, reward_auc, "return", "return", "Return vs steps by mode", "06_return_by_mode_subplots.png", args.plot_dir)
+    save_metric_by_mode_subplots(episodes, reward_auc, "success", "success rate", "Success rate vs steps by mode", "07_success_by_mode_subplots.png", args.plot_dir)
     save_certainty_histogram(episodes, steps, args.plot_dir)
     save_scatter(steps, "entropy", "certainty", "04_certainty_vs_entropy_scatter.png", "Certainty vs entropy scatter", args.plot_dir)
     save_scatter(steps, "delta", "certainty", "05_certainty_vs_delta_t_scatter.png", "Certainty vs delta_t scatter", args.plot_dir)

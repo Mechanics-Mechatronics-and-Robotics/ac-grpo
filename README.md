@@ -24,6 +24,8 @@ At a high level, the methodology follows the same intuition as **SimpleVLA-RL**:
 
 ## Table of Contents
 
+- [Environment Setup](#environment-setup)
+- [How To Run](#how-to-run)
 - [Task Setting](#task-setting)
 - [Training Regime](#training-regime)
 - [Reward Modes](#reward-modes)
@@ -42,6 +44,90 @@ At a high level, the methodology follows the same intuition as **SimpleVLA-RL**:
 - [Logged Quantities](#logged-quantities)
 - [Evaluation Protocol](#evaluation-protocol)
 - [Design Principle](#design-principle)
+- [Results](#results)
+
+---
+
+## Environment Setup
+
+The project is designed to run in a small Python environment with `gymnasium`, `box2d`, `torch`, and the analysis stack used by the reporting scripts.
+
+### 1. Create and activate a virtual environment
+
+On Windows PowerShell:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+On Linux or macOS:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+### 2. Install dependencies
+
+```powershell
+py -m pip install --upgrade pip
+py -m pip install -r requirements.txt
+```
+
+If you want GPU training, install a CUDA-enabled PyTorch build instead of the current CPU-only default. The trainers already switch to `cuda` automatically when `torch.cuda.is_available()` is true.
+
+### 3. Verify the environment
+
+```powershell
+py -c "import torch, gymnasium; print(torch.__version__, torch.cuda.is_available())"
+```
+
+---
+
+## How To Run
+
+### Run the full experiment grid
+
+This launches the current full matrix and writes exactly one timestamped folder under `outputs/`:
+
+```powershell
+py scripts\run_all_seeds.py --all --max-parallel-seeds 5
+```
+
+You can override the training horizon if needed:
+
+```powershell
+py scripts\run_all_seeds.py --all --total-steps 250000 --max-parallel-seeds 5
+```
+
+### Run one branch only
+
+Examples:
+
+```powershell
+py scripts\run_all_seeds.py --experiment baseline_sparse_clean --max-parallel-seeds 5
+py scripts\run_all_seeds.py --experiment ac_lite_dense_obs_noise --max-parallel-seeds 5
+py scripts\run_all_seeds.py --experiment ac_full_sparse_reward_noise --max-parallel-seeds 5
+```
+
+### Run a quick smoke test
+
+This uses seed `42` only and is useful for checking that logging, checkpointing, and plotting still work:
+
+```powershell
+py scripts\run_all_seeds.py --experiment ac_full_sparse_clean --smoke --total-steps 2000
+```
+
+### Rebuild plots and reports without retraining
+
+If an `all_experiments` folder already exists, you can regenerate `plots/` and `report.md` from the saved CSV logs:
+
+```powershell
+py scripts\analyze.py --log-dir G:\ac-grpo\outputs\YOUR_RUN_FOLDER --plot-dir G:\ac-grpo\outputs\YOUR_RUN_FOLDER\plots
+```
+
+This does **not** retrain the models.
 
 ---
 
@@ -554,7 +640,29 @@ The core theoretical claim being tested is:
 
 > A certainty signal trained from action commitment alone — with no direct access to reward — can identify unreliable training steps and reduce their contribution to the PPO policy gradient, improving robustness under noisy or sparse supervision.
 
-#Results
+## Results
+
+The table below summarizes one representative cross-test slice of the project: best checkpoints are selected within their training branches and then evaluated under observation noise. Each cell is reported as:
+
+```text
+mean return ± std / mean success ± std
+```
+
+This view is useful because it emphasizes robustness rather than raw clean-training performance. In particular:
+
+- `Train: CLEAN → Test OBS` asks whether a method trained in the nominal setting transfers to noisy observations.
+- `Train: OBS → Test OBS` measures matched-condition robustness under observation corruption.
+- `Train: REWARD → Test OBS` checks whether training under reward corruption still produces policies that survive observation noise at test time.
+
+A few high-level takeaways from this table:
+
+- Dense-reward baselines are strong under observation-noise testing, which is expected because dense reward gives PPO a richer within-episode learning signal than sparse terminal reward.
+- `AC-LITE (Dense)` is especially competitive in the noisy setting and achieves the strongest `Train: OBS → Test OBS` result in this snapshot.
+- `AC-FULL (Sparse)` improves over sparse baseline and sparse AC-LITE under matched observation-noise training, which is encouraging for the full certainty model in the sparse regime.
+- The sparse reward-noise branches remain harder: they preserve some robustness, but they generally lag behind the dense-reward variants on this particular observation-noise transfer test.
+
+These results should be interpreted together with checkpoint-wise evaluation rather than final training performance alone. The project explicitly treats the pretrained anchor as checkpoint `0`, and later training is not assumed to improve the model automatically.
+
 | Method | Train: CLEAN → Test OBS | Train: OBS → Test OBS | Train: REWARD → Test OBS |
 |---|---:|---:|---:|
 | **Baseline (Sparse)** | 173.6 ± 121.7 / 0.574 ± 0.495 | 260.0 ± 67.5 / 0.914 ± 0.281 | 170.0 ± 113.1 / 0.508 ± 0.500 |
