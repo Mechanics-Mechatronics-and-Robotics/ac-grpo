@@ -553,3 +553,12 @@ Only the certainty mechanism differs. In implementation terms, the current proje
 The core theoretical claim being tested is:
 
 > A certainty signal trained from action commitment alone — with no direct access to reward — can identify unreliable training steps and reduce their contribution to the PPO policy gradient, improving robustness under noisy or sparse supervision.
+
+#Results
+| Method | Train: CLEAN → Test OBS | Train: OBS → Test OBS | Train: REWARD → Test OBS |
+|---|---:|---:|---:|
+| **Baseline (Sparse)** | 173.6 ± 121.7 / 0.574 ± 0.495 | 260.0 ± 67.5 / 0.914 ± 0.281 | 170.0 ± 113.1 / 0.508 ± 0.500 |
+| **Baseline (Dense)** | **220.2 ± 105.3** / **0.746 ± 0.436** | 262.0 ± 50.4 / 0.936 ± 0.245 | **219.7 ± 105.4** / **0.742 ± 0.438** |
+| AC-LITE (Sparse) | 200.1 ± 112.2 / 0.654 ± 0.476 | 262.2 ± 60.9 / 0.924 ± 0.265 | 166.7 ± 120.1 / 0.510 ± 0.500 |
+| **AC-LITE (Dense)** | **218.7 ± 106.4** / **0.736 ± 0.441** | **271.9 ± 35.8** / **0.974 ± 0.159** | **230.9 ± 94.7** / **0.792 ± 0.406** |
+| **AC-FULL (Sparse)** | 210.1 ± 99.1 / 0.676 ± 0.468 | **266.7 ± 53.5** / 0.956 ± 0.205 | 166.3 ± 123.4 / 0.530 ± 0.500 |
