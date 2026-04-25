@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate AC-PPO diagnostic plots and report.")
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
     parser.add_argument("--plot-dir", type=Path, default=PLOT_DIR)
+    parser.add_argument("--report-only", action="store_true", help="Write report.md without regenerating plots.")
     return parser.parse_args()
 
 
@@ -87,7 +88,7 @@ def _coerce_episode_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_logs(log_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_logs(log_dir: Path, include_steps: bool = True, include_updates: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     episode_frames = []
     step_frames = []
     update_frames = []
@@ -100,24 +101,26 @@ def load_logs(log_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         df["mode"] = mode
         df["seed"] = seed
         episode_frames.append(df)
-    for path in log_dir.rglob("*_steps.csv"):
-        df = pd.read_csv(path)
-        method_family, reward_mode, mode, seed, method_label = parse_run_name(path)
-        df["method_family"] = method_family
-        df["reward_mode"] = reward_mode
-        df["method"] = method_label
-        df["mode"] = mode
-        df["seed"] = seed
-        step_frames.append(df)
-    for path in log_dir.rglob("*_updates.csv"):
-        df = pd.read_csv(path)
-        method_family, reward_mode, mode, seed, method_label = parse_run_name(path)
-        df["method_family"] = method_family
-        df["reward_mode"] = reward_mode
-        df["method"] = method_label
-        df["mode"] = mode
-        df["seed"] = seed
-        update_frames.append(df)
+    if include_steps:
+        for path in log_dir.rglob("*_steps.csv"):
+            df = pd.read_csv(path)
+            method_family, reward_mode, mode, seed, method_label = parse_run_name(path)
+            df["method_family"] = method_family
+            df["reward_mode"] = reward_mode
+            df["method"] = method_label
+            df["mode"] = mode
+            df["seed"] = seed
+            step_frames.append(df)
+    if include_updates:
+        for path in log_dir.rglob("*_updates.csv"):
+            df = pd.read_csv(path)
+            method_family, reward_mode, mode, seed, method_label = parse_run_name(path)
+            df["method_family"] = method_family
+            df["reward_mode"] = reward_mode
+            df["method"] = method_label
+            df["mode"] = mode
+            df["seed"] = seed
+            update_frames.append(df)
     episodes = pd.concat(episode_frames, ignore_index=True) if episode_frames else pd.DataFrame()
     steps = pd.concat(step_frames, ignore_index=True) if step_frames else pd.DataFrame()
     updates = pd.concat(update_frames, ignore_index=True) if update_frames else pd.DataFrame()
@@ -357,10 +360,12 @@ def save_metric_by_mode_subplots(
 def save_certainty_histogram(episodes: pd.DataFrame, steps: pd.DataFrame, plot_dir: Path) -> None:
     if steps.empty or "certainty" not in steps.columns:
         return
-    cert_df = steps.copy()
+    step_cols = ["method", "mode", "seed", "episode_id", "certainty"]
+    episode_cols = ["method", "mode", "seed", "episode_id", "success"]
+    cert_df = steps[step_cols].copy()
     cert_df["certainty"] = pd.to_numeric(cert_df["certainty"], errors="coerce")
     cert_df = cert_df.merge(
-        episodes[["method", "mode", "seed", "episode_id", "success"]],
+        episodes[episode_cols],
         on=["method", "mode", "seed", "episode_id"],
         how="left",
     )
@@ -902,17 +907,18 @@ def main() -> None:
     args = parse_args()
     ensure_output_dirs()
     args.plot_dir.mkdir(parents=True, exist_ok=True)
-    episodes, steps, updates = load_logs(args.log_dir)
+    episodes, steps, updates = load_logs(args.log_dir, include_steps=not args.report_only, include_updates=not args.report_only)
     if episodes.empty:
         raise SystemExit(f"No episode logs found in {args.log_dir}")
-    _, reward_auc = _compute_reward_auc_tables(episodes, window=20)
-    save_return_vs_steps(episodes, reward_auc, args.plot_dir)
-    save_success_vs_steps(episodes, reward_auc, args.plot_dir)
-    save_metric_by_mode_subplots(episodes, reward_auc, "return", "return", "Return vs steps by mode", "06_return_by_mode_subplots.png", args.plot_dir)
-    save_metric_by_mode_subplots(episodes, reward_auc, "success", "success rate", "Success rate vs steps by mode", "07_success_by_mode_subplots.png", args.plot_dir)
-    save_certainty_histogram(episodes, steps, args.plot_dir)
-    save_scatter(steps, "entropy", "certainty", "04_certainty_vs_entropy_scatter.png", "Certainty vs entropy scatter", args.plot_dir)
-    save_scatter(steps, "delta", "certainty", "05_certainty_vs_delta_t_scatter.png", "Certainty vs delta_t scatter", args.plot_dir)
+    if not args.report_only:
+        _, reward_auc = _compute_reward_auc_tables(episodes, window=20)
+        save_return_vs_steps(episodes, reward_auc, args.plot_dir)
+        save_success_vs_steps(episodes, reward_auc, args.plot_dir)
+        save_metric_by_mode_subplots(episodes, reward_auc, "return", "return", "Return vs steps by mode", "06_return_by_mode_subplots.png", args.plot_dir)
+        save_metric_by_mode_subplots(episodes, reward_auc, "success", "success rate", "Success rate vs steps by mode", "07_success_by_mode_subplots.png", args.plot_dir)
+        save_certainty_histogram(episodes, steps, args.plot_dir)
+        save_scatter(steps, "entropy", "certainty", "04_certainty_vs_entropy_scatter.png", "Certainty vs entropy scatter", args.plot_dir)
+        save_scatter(steps, "delta", "certainty", "05_certainty_vs_delta_t_scatter.png", "Certainty vs delta_t scatter", args.plot_dir)
     write_report(episodes, steps, updates, args.log_dir)
 
 

@@ -510,7 +510,8 @@ class ACPPOTrainer:
                 ratio_maxes.append(float(mixture_ratio_max))
                 delta_mins.append(float(rollout["delta_old"][mb].min().item()))
                 delta_maxes.append(float(rollout["delta_old"][mb].max().item()))
-                gated_advantages = certainty_mb.detach() * advantages[mb]
+                certainty_gate = certainty_mb.detach() if self.config.detach_certainty_in_policy_loss else certainty_mb
+                gated_advantages = certainty_gate * advantages[mb]
                 pg_loss = -torch.min(
                     gated_advantages * ratio,
                     gated_advantages * torch.clamp(ratio, 1.0 - self.config.epsilon_low, 1.0 + self.config.epsilon_high),

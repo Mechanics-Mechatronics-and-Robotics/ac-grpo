@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smoke", action="store_true", help="Run seed 42 only.")
     parser.add_argument("--max-parallel-seeds", type=int, default=None, help="Run up to this many seeds concurrently. Defaults to all selected seeds.")
     parser.add_argument("--reward-mode", choices=REWARD_MODES, default=None, help="Override the experiment reward mode.")
+    parser.add_argument("--no-detach-certainty-in-policy-loss", action="store_true", help="Let PPO policy loss backprop through certainty in AC methods.")
     return parser.parse_args()
 
 
@@ -59,6 +60,7 @@ def build_seed_command(
     pretrained_policy_path: str | None,
     freeze_pretrained_policy: bool,
     config_defaults: TrainConfig,
+    no_detach_certainty_in_policy_loss: bool,
 ) -> list[str]:
     reward_mode = str(settings.get("reward_mode", config_defaults.reward_mode))
     run_name = f"{method}_{reward_mode}"
@@ -134,6 +136,8 @@ def build_seed_command(
         command.append("--grouped-rollouts")
     if settings["dynamic_sampling"]:
         command.append("--dynamic-sampling")
+    if no_detach_certainty_in_policy_loss:
+        command.append("--no-detach-certainty-in-policy-loss")
     if pretrained_policy_path:
         command.extend(["--pretrained-policy-path", pretrained_policy_path])
     if freeze_pretrained_policy:
@@ -240,6 +244,7 @@ def run_one_experiment(
     freeze_pretrained_policy: bool,
     max_parallel_seeds: int,
     reward_mode_override: str | None,
+    no_detach_certainty_in_policy_loss: bool,
 ) -> Path:
     experiments = {**BASELINE_EXPERIMENTS, **METHOD_MODE_EXPERIMENTS}
     settings = dict(experiments[experiment_name])
@@ -257,6 +262,7 @@ def run_one_experiment(
         "seeds": list(seeds),
         "pretrained_policy_path": pretrained_policy_path,
         "freeze_pretrained_policy": freeze_pretrained_policy,
+        "detach_certainty_in_policy_loss": not no_detach_certainty_in_policy_loss,
         **settings,
     }
     write_yaml(run_dir / "config.yaml", config_payload)
@@ -269,6 +275,7 @@ def run_one_experiment(
             pretrained_policy_path,
             freeze_pretrained_policy,
             config_defaults,
+            no_detach_certainty_in_policy_loss,
         )
         for seed in seeds
     ]
@@ -298,6 +305,7 @@ def main() -> None:
         "reward_mode_override": args.reward_mode,
         "pretrained_policy_path": args.pretrained_policy_path,
         "freeze_pretrained_policy": args.freeze_pretrained_policy,
+        "detach_certainty_in_policy_loss": not args.no_detach_certainty_in_policy_loss,
     })
     run_dirs = [
         run_one_experiment(
@@ -311,6 +319,7 @@ def main() -> None:
             freeze_pretrained_policy=args.freeze_pretrained_policy,
             max_parallel_seeds=max_parallel_seeds,
             reward_mode_override=args.reward_mode,
+            no_detach_certainty_in_policy_loss=args.no_detach_certainty_in_policy_loss,
         )
         for name in names
     ]
@@ -321,6 +330,7 @@ def main() -> None:
         "reward_mode": args.reward_mode,
         "pretrained_policy_path": args.pretrained_policy_path,
         "freeze_pretrained_policy": args.freeze_pretrained_policy,
+        "detach_certainty_in_policy_loss": not args.no_detach_certainty_in_policy_loss,
     }
     (parent_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     run_command([sys.executable, "scripts/analyze.py", "--log-dir", str(parent_dir), "--plot-dir", str(parent_dir / "plots")], repo)

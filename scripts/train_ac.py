@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dynamic-sampling-warmup-steps", type=int, default=TrainConfig().dynamic_sampling_warmup_steps)
     parser.add_argument("--pretrained-policy-path", default=TrainConfig().pretrained_policy_path)
     parser.add_argument("--freeze-pretrained-policy", action="store_true")
+    parser.add_argument("--no-detach-certainty-in-policy-loss", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--run-name", default=None)
     return parser.parse_args()
@@ -49,6 +50,7 @@ def main() -> None:
         dynamic_sampling_warmup_steps=args.dynamic_sampling_warmup_steps,
         pretrained_policy_path=args.pretrained_policy_path,
         freeze_pretrained_policy=args.freeze_pretrained_policy,
+        detach_certainty_in_policy_loss=not args.no_detach_certainty_in_policy_loss,
     )
     summary = ACPPOTrainer(
         method=args.method,

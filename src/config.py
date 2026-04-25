@@ -38,7 +38,7 @@ BEST_EXPERIMENT_SETTINGS = {
     "rollout_temperature": 1.0,
     "epsilon_low": 0.2,
     "epsilon_high": 0.2,
-    "total_steps": 1000_000,
+    "total_steps": 250_000,
     "dynamic_sampling_warmup_steps": 10_000,
     "reward_mode": "SPARSE",
 }
@@ -108,9 +108,9 @@ class TrainConfig:
     steps_per_update: int = 2048
     batch_size: int = 64
     total_steps: int = 60_000
-    learning_rate: float = 1e-4
-    policy_lr: float = 1e-4
-    certainty_lr: float = 1e-4
+    learning_rate: float = 3e-4
+    policy_lr: float = 3e-4
+    certainty_lr: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
     epsilon_low: float = 0.2
@@ -127,7 +127,7 @@ class TrainConfig:
     pretrained_policy_path: str | None = str(DEFAULT_PRETRAINED_POLICY)
     load_pretrained_critic: bool = False
     freeze_pretrained_policy: bool = False
-    checkpoint_interval: int = 50_000
+    checkpoint_interval: int = 10_000
     eval_seeds: tuple[int, ...] = (101, 102, 103)
     eval_episodes_per_seed: int = 5
     test_eval_seeds: tuple[int, ...] = (201, 202, 203, 204, 205)
@@ -141,6 +141,7 @@ class TrainConfig:
     dynamic_sampling_warmup_steps: int = 150_000
     dynamic_sampling_fallback_on_empty: bool = True
     skip_policy_update_on_unmixed_fallback: bool = True
+    detach_certainty_in_policy_loss: bool = True
 
 
 def ensure_output_dirs() -> None:
